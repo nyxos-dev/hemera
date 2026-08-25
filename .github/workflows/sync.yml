@@ -1,0 +1,37 @@
+name: Sync from nyx-os
+
+# Keep this component's source in step with the monolithic nyx-os repo:
+# once a day (and on demand) pull the latest compositor sources and, if
+# anything changed, commit them here. The submodule that nyx-os keeps for
+# this repo then just needs its pointer bumped to pick the change up.
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull compositor sources from nyx-os
+        run: |
+          rm -rf _nyxos
+          git clone --depth 1 https://github.com/nyxos-dev/nyx-os _nyxos
+          rm -rf src && mkdir -p src
+          cp _nyxos/kernel/gui/core/*.c _nyxos/kernel/gui/core/*.h src/
+          rm -rf _nyxos
+      - name: Commit if changed
+        run: |
+          git config user.name  "kazah-png"
+          git config user.email "kazah.png@proton.me"
+          git add -A src
+          if git diff --cached --quiet; then
+            echo "already up to date"
+          else
+            git commit -m "sync: refresh sources from nyx-os"
+            git push
+          fi
