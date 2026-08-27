@@ -470,7 +470,7 @@ static int start_menu_hit(int mx, int my) {
 // type-to-search filter share ONE list. The index IS do_start_menu_action()'s arg.
 static const char* const start_items[START_ITEM_N] = {
     "File Manager", "Text Editor", "Image Viewer", "Terminal",
-    "Settings", "Task Manager", "Selene",
+    "Settings", "Nyx Monitor", "Selene",
     "Paint", "Sound Test", "About", "Shutdown", "Calculator",
     "Games",
 };
@@ -2235,14 +2235,15 @@ static void do_start_menu_action(int idx) {
                 }
             }
             break;
-        case 5: // Task Manager
+        case 5: // Nyx Monitor (performance + process monitor)
             {
-                window_t* twin = window_create(100, 80, 480, 340, "Task Manager", taskman_win_draw);
+                window_t* twin = window_create(100, 70, 520, 430, "Nyx Monitor", taskman_win_draw);
                 if (twin) {
                     twin->reserved = taskman_create_ctx();
                     if (twin->reserved) {
                         twin->on_key = taskman_win_key;
                         twin->on_click = taskman_win_click;
+                        twin->on_tick = taskman_win_tick;   // ~4 Hz live CPU/RAM graph sampling
                     }
                 }
             }
@@ -2986,10 +2987,13 @@ static void settings_draw_fn(window_t* win, int cx, int cy, uint32_t cw, uint32_
         y += 24;
         snprintf(buf, sizeof(buf), "Kernel: %s %s (%s)", KERNEL_NAME, KERNEL_VERSION, KERNEL_CODENAME);
         font_draw_string(cx + 10, y, buf, fb_rgb(200,200,200), fb_rgb(30,30,35)); y += 18;
-        snprintf(buf, sizeof(buf), "Memory: %d MB total, %d MB free",
-            memory_total / (1024*1024), (memory_total - memory_used) / (1024*1024));
+        uint32_t mi_used_kb, mi_free_kb, mi_total_kb;
+        mem_pool_kb(&mi_used_kb, &mi_free_kb, &mi_total_kb);   // same source as top / nyxfetch / Nyx Monitor
+        snprintf(buf, sizeof(buf), "Memory: %u MB used / %u MB (%u%% used, %u MB free)",
+            mi_used_kb / 1024, mi_total_kb / 1024,
+            mi_total_kb ? (uint32_t)(((uint64_t)mi_used_kb * 100) / mi_total_kb) : 0, mi_free_kb / 1024);
         font_draw_string(cx + 10, y, buf, fb_rgb(200,200,200), fb_rgb(30,30,35)); y += 18;
-        snprintf(buf, sizeof(buf), "Uptime: %d sec", tick_count / 1000);
+        snprintf(buf, sizeof(buf), "Uptime: %u sec", get_uptime_seconds());
         font_draw_string(cx + 10, y, buf, fb_rgb(200,200,200), fb_rgb(30,30,35)); y += 18;
         snprintf(buf, sizeof(buf), "Heap: %d KB", KERNEL_HEAP_SIZE / 1024);
         font_draw_string(cx + 10, y, buf, fb_rgb(200,200,200), fb_rgb(30,30,35)); y += 18;
