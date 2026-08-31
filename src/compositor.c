@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "../../drivers/video/font.h"
 #include "../apps/terminal_win.h"
+#include "../apps/aeronyx_win.h"
 #include "../games/pong_win.h"
 #include "../games/voxel_win.h"
 #include "../games/fire_win.h"
@@ -78,6 +79,20 @@ static const uint8_t cursor_data[CURSOR_H][CURSOR_W] = {
     {1,2,2,2,1,2,2,1,0,0,0,0},{1,2,1,0,0,1,2,2,1,0,0,0},
     {1,1,0,0,0,1,2,2,1,0,0,0},{0,0,0,0,0,0,1,2,2,1,0,0},
 };
+// I-beam: a white (2) vertical bar with a black (1) outline + top/bottom serifs, so the
+// pointer reads as a text caret over Terminal/Editor content. Same 0/1/2 encoding + 12x16
+// box as the arrow, so it shares draw_cursor's save/restore path (only the bitmap swaps).
+static const uint8_t ibeam_data[CURSOR_H][CURSOR_W] = {
+    {0,0,0,1,1,1,1,1,1,0,0,0},{0,0,0,1,2,2,2,2,1,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,1,2,2,2,2,1,0,0,0},{0,0,0,1,1,1,1,1,1,0,0,0},
+};
+static int pick_cursor_shape(int mx, int my);   // defined after window_hit (below)
 static uint32_t cursor_bg_buf[CURSOR_H * CURSOR_W];
 static int cursor_saved = 0;
 
@@ -113,9 +128,13 @@ static void draw_cursor(int mx, int my) {
     uint32_t* fb = (uint32_t*)fb_get_addr();
     if (!fb) return;
 
+    // Context cursor: an I-beam over a text window's client area, the arrow otherwise.
+    // The saved/restored 12x16 box is the same for both, so only the bitmap changes.
+    const uint8_t (*glyph)[CURSOR_W] =
+        (pick_cursor_shape(mx, my) == CURSOR_IBEAM) ? ibeam_data : cursor_data;
     for (int y = 0; y < CURSOR_H && my + y < (int)fh; y++) {
         for (int x = 0; x < CURSOR_W && mx + x < (int)fw; x++) {
-            uint8_t p = cursor_data[y][x];
+            uint8_t p = glyph[y][x];
             if (p == 0) continue;
             if (p == 2)
                 fb[(my + y) * fw + (mx + x)] = 0xFFFFFF;
@@ -376,6 +395,49 @@ static int min_hit(window_t* win, int mx, int my) {
 static int window_hit(window_t* win, int mx, int my) {
     return mx >= win->x && mx < win->x + (int)win->w
         && my >= win->y && my < win->y + (int)win_total_h(win);
+}
+
+// Which cursor shape belongs at (mx,my): the topmost window under the pointer decides.
+// Over its CLIENT area (below the title bar) the pointer takes that window's cursor_shape
+// (I-beam for text windows); over the title bar or the bare desktop it stays the arrow.
+static int pick_cursor_shape(int mx, int my) {
+    window_t* top = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t* w = windows[i];
+        if (!w || !w->visible) continue;
+        if (w->workspace != current_workspace || w->state == WSTATE_MINIMIZED) continue;
+        if (!window_hit(w, mx, my)) continue;
+        if (!top || w->z_order > top->z_order) top = w;
+    }
+    if (!top) return CURSOR_ARROW;
+    if (my >= top->y + TITLE_H) return top->cursor_shape;   // client area
+    return CURSOR_ARROW;                                    // title bar
+}
+
+// KAT: the pointer shape is picked from the topmost window under it — I-beam over a text
+// window's client area, arrow over its title bar / the bare desktop / a non-text window.
+// Stages a throwaway window in the (idle, pre-run) compositor table and restores it.
+int cursor_pick_selftest(void) {
+    static window_t fake;
+    memset_asm(&fake, 0, sizeof fake);
+    fake.x = 100; fake.y = 100; fake.w = 200; fake.h = 150;
+    fake.visible = 1; fake.state = WSTATE_NORMAL; fake.z_order = 7;
+    fake.workspace = current_workspace;
+    fake.cursor_shape = CURSOR_IBEAM;
+    int slot = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (!windows[i]) { slot = i; break; }
+    if (slot < 0) return 5;
+    windows[slot] = &fake;
+    int rc = 0;
+    if      (pick_cursor_shape(150, 100 + TITLE_H + 30) != CURSOR_IBEAM) rc = 10; // client -> I-beam
+    else if (pick_cursor_shape(150, 100 + 5)            != CURSOR_ARROW) rc = 11; // title bar -> arrow
+    else if (pick_cursor_shape(400, 400)                != CURSOR_ARROW) rc = 12; // off-window -> arrow
+    else {                                                                        // arrow window keeps arrow
+        fake.cursor_shape = CURSOR_ARROW;
+        if (pick_cursor_shape(150, 100 + TITLE_H + 30)  != CURSOR_ARROW) rc = 13;
+    }
+    windows[slot] = NULL;
+    return rc;
 }
 
 static int resize_hit(window_t* win, int mx, int my, int* dir) {
@@ -1228,7 +1290,9 @@ static void bg_ripple_ring(int cx, int cy, int r, int fw, int fh,
             int rr = skr + (214 - skr) * inten / 100;
             int gg = skg + (200 - skg) * inten / 100;
             int bl = skb + (248 - skb) * inten / 100;
-            if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bl > 255) bl = 255;
+            if (rr > 255) rr = 255;
+            if (gg > 255) gg = 255;
+            if (bl > 255) bl = 255;
             fb_fill_rect(px, py, 2, 2, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bl));
         }
         y++; err += 1 + 2 * y;
@@ -1252,7 +1316,9 @@ static void bg_star_line(int x0, int y0, int x1, int y1, int fw, int fh,
             int rr = skr + (206 - skr) * inten / 100;
             int gg = skg + (196 - skg) * inten / 100;
             int bl = skb + (240 - skb) * inten / 100;
-            if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bl > 255) bl = 255;
+            if (rr > 255) rr = 255;
+            if (gg > 255) gg = 255;
+            if (bl > 255) bl = 255;
             fb_fill_rect(x0, y0, 1, 1, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bl));
         }
         if (x0 == x1 && y0 == y1) break;
@@ -1404,7 +1470,9 @@ static void draw_background(void) {
                     int rr = skr + (cur[k].cr - skr) * lum / 100;
                     int gg = skg + (cur[k].cg - skg) * lum / 100;
                     int bb2 = skb + (cur[k].cb - skb) * lum / 100;
-                    if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bb2 > 255) bb2 = 255;
+                    if (rr > 255) rr = 255;
+                    if (gg > 255) gg = 255;
+                    if (bb2 > 255) bb2 = 255;
                     fb_fill_rect(x, yy, 3, 2, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bb2));
                 }
             }
@@ -1437,8 +1505,12 @@ static void draw_background(void) {
                 int rr = skr + (nr - skr) * inten / 100;
                 int gg = skg + (ng - skg) * inten / 100;
                 int bb2 = skb + (nb - skb) * inten / 100;
-                if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bb2 > 255) bb2 = 255;
-                if (rr < 0) rr = 0; if (gg < 0) gg = 0; if (bb2 < 0) bb2 = 0;
+                if (rr > 255) rr = 255;
+                if (gg > 255) gg = 255;
+                if (bb2 > 255) bb2 = 255;
+                if (rr < 0) rr = 0;
+                if (gg < 0) gg = 0;
+                if (bb2 < 0) bb2 = 0;
                 fb_fill_rect(x, y, 3, 2, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bb2));
             }
         }
@@ -1453,13 +1525,13 @@ static void draw_background(void) {
     // falloff, so it glows over the gradient + stars with no hard edge.
     if (style == WP_STYLE_LUCES) {
         uint32_t tms = get_ticks();
-        uint32_t seed = 0x1234567u;
+        uint32_t seed2 = 0x1234567u;
         int span = (int)fh + 48;                        // rise distance before wrap
         for (int i = 0; i < 16; i++) {
-            seed = seed * 1103515245u + 12345u; int lane  = (int)((seed >> 9) % fw);
-            seed = seed * 1103515245u + 12345u; int phase = (int)((seed >> 9) & 255);
-            seed = seed * 1103515245u + 12345u; int spd   = 34 + (int)((seed >> 9) % 34);   // ms per px up
-            seed = seed * 1103515245u + 12345u; int amp   = 16 + (int)((seed >> 9) % 40);   // sway px
+            seed2 = seed2 * 1103515245u + 12345u; int lane  = (int)((seed2 >> 9) % fw);
+            seed2 = seed2 * 1103515245u + 12345u; int phase = (int)((seed2 >> 9) & 255);
+            seed2 = seed2 * 1103515245u + 12345u; int spd   = 34 + (int)((seed2 >> 9) % 34);   // ms per px up
+            seed2 = seed2 * 1103515245u + 12345u; int amp   = 16 + (int)((seed2 >> 9) % 40);   // sway px
             int yy = (int)fh + 24 - (int)((tms / (uint32_t)spd + (uint32_t)phase * 4u) % (uint32_t)span);
             int xx = lane + wp_isin((int)(tms / 40) + phase) * amp / 1024;
             if (xx < 0 || xx >= (int)fw || yy < 0 || yy >= (int)fh) continue;
@@ -1479,7 +1551,9 @@ static void draw_background(void) {
                     int rr = skr + (214 - skr) * inten / 100;
                     int gg = skg + (194 - skg) * inten / 100;
                     int bb2 = skb + (248 - skb) * inten / 100;
-                    if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bb2 > 255) bb2 = 255;
+                    if (rr > 255) rr = 255;
+                    if (gg > 255) gg = 255;
+                    if (bb2 > 255) bb2 = 255;
                     fb_fill_rect(px, py, 1, 1, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bb2));
                 }
             }
@@ -1494,9 +1568,9 @@ static void draw_background(void) {
         int maxr = (int)fw;                          // a ring reaches the far side, then wraps
         const int NR = 4;
         int step = maxr / NR;
-        int base = (int)(tms / 5) % step;            // shared outward phase (px)
+        int base2 = (int)(tms / 5) % step;            // shared outward phase (px)
         for (int k = 0; k < NR; k++) {
-            int r = base + k * step;
+            int r = base2 + k * step;
             if (r < mr + 10) continue;               // keep clear of the moon disc
             int inten = 42 * (maxr - r) / maxr;      // bright when young, fades as it grows
             bg_ripple_ring(mx, my, r, (int)fw, (int)fh, br, bg, bb, inten);
@@ -1523,8 +1597,10 @@ static void draw_background(void) {
             for (int k = 1; k < npts; k++) {
                 cs = cs * 1103515245u + 12345u; int nx = px + (int)((cs >> 10) % 66) - 33;
                 cs = cs * 1103515245u + 12345u; int ny = py + (int)((cs >> 10) % 56) - 28;
-                if (nx < 10) nx = 10; if (nx > (int)fw - 10) nx = (int)fw - 10;
-                if (ny < 10) ny = 10; if (ny > (int)star_zone) ny = (int)star_zone;
+                if (nx < 10) nx = 10;
+                if (nx > (int)fw - 10) nx = (int)fw - 10;
+                if (ny < 10) ny = 10;
+                if (ny > (int)star_zone) ny = (int)star_zone;
                 bg_star_line(px, py, nx, ny, (int)fw, (int)fh, br, bg, bb, 34);   // faint thread
                 fb_fill_rect(nx, ny, 2, 2, fb_rgb(210, 204, 242));               // vertex star
                 px = nx; py = ny;
@@ -1565,7 +1641,9 @@ static void draw_background(void) {
                 int rr = skr + (214 - skr) * inten / 100;
                 int gg = skg + (202 - skg) * inten / 100;
                 int bl = skb + (244 - skb) * inten / 100;
-                if (rr > 255) rr = 255; if (gg > 255) gg = 255; if (bl > 255) bl = 255;
+                if (rr > 255) rr = 255;
+                if (gg > 255) gg = 255;
+                if (bl > 255) bl = 255;
                 fb_fill_rect(hx, py, (s < 3) ? 2 : 1, 1, fb_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bl));
             }
         }
@@ -1827,6 +1905,7 @@ static window_t* find_window(int id) {
 window_t* compositor_open_editor(const char* path) {
     window_t* ewin = window_create(150, 120, 600, 400, EDITOR_NAME, editor_win_draw);
     if (!ewin) return NULL;
+    ewin->cursor_shape = CURSOR_IBEAM;   // Mnemosyne: text area -> I-beam pointer
     ewin->reserved = editor_create_ctx();
     if (!ewin->reserved) { window_destroy(ewin->id); return NULL; }
     ewin->on_click = editor_win_click;
@@ -1974,6 +2053,7 @@ void launch_nyxflex(void) {
     NF_POS(0, hh, 640, 400, tx, ty);
     window_t* tw = window_create(tx, ty, 640, 400, "Terminal", terminal_win_draw);
     if (tw) {
+        tw->cursor_shape = CURSOR_IBEAM;   // Erebus: text area -> I-beam pointer
         tw->reserved = terminal_create_ctx();
         if (tw->reserved) {
             tw->on_key = terminal_win_key;
@@ -2043,6 +2123,16 @@ void launch_rotor(void) {
     if (!w->reserved) { window_destroy(w->id); return; }
     w->on_tick = rotor_win_tick;
     w->on_key  = rotor_win_key;
+}
+
+void launch_aeronyx(void) {
+    int px = ((int)fb_get_width()  - AERONYX_WIN_W) / 2;              if (px < 0) px = 0;
+    int py = ((int)fb_get_height() - AERONYX_WIN_H - TITLE_H) / 2;    if (py < 0) py = 0;
+    window_t* w = window_create(px, py, AERONYX_WIN_W, AERONYX_WIN_H, "Aeronyx", aeronyx_win_draw);
+    if (!w) return;
+    w->reserved = aeronyx_create_ctx();
+    if (!w->reserved) { window_destroy(w->id); return; }
+    w->on_tick = aeronyx_win_tick;
 }
 
 void launch_fill(void) {
@@ -2220,6 +2310,7 @@ static void do_start_menu_action(int idx) {
             {
                 window_t* twin = window_create(80, 80, 640, 400, "Terminal", terminal_win_draw);
                 if (twin) {
+                    twin->cursor_shape = CURSOR_IBEAM;   // Erebus: text area -> I-beam pointer
                     twin->reserved = terminal_create_ctx();
                     twin->on_key = terminal_win_key;
                 }
@@ -3720,7 +3811,8 @@ void compositor_run(void) {
                         int bx = spk_mute_x(), by = spk_mute_y();
                         if (mx >= tx - 4 && mx <= tx + tw + 4 && my >= ty - 5 && my <= ty + SPK_TRACK_H + 5) {
                             int v = (mx - tx) * 100 / (tw > 0 ? tw : 1);   // click the track to set volume
-                            if (v < 0) v = 0; if (v > 100) v = 100;
+                            if (v < 0) v = 0;
+                            if (v > 100) v = 100;
                             g_volume = v; g_muted = 0; apply_volume(); redraw = 1;
                         } else if (mx >= bx && mx < bx + SPK_MUTE_W && my >= by && my < by + SPK_MUTE_H) {
                             g_muted = !g_muted; apply_volume(); redraw = 1;    // toggle mute
