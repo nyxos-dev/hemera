@@ -54,6 +54,7 @@ int compositor_logout_requested = 0; // set by the user menu; boot loop re-shows
 static int ctx_menu_open = 0;
 static int ctx_menu_x = 0, ctx_menu_y = 0;
 static int cal_popup_open = 0;      // the taskbar clock's calendar popup
+static int g_clock_12h = 0;         // taskbar clock: 0 = 24-hour (default), 1 = 12-hour AM/PM — nyx.conf `clock`
 static int net_popup_open = 0;      // the system tray's network-status popup
 static int spk_popup_open = 0;      // the system tray's sound/volume popup
 static int g_volume = 75;           // master volume 0..100 (persisted while running)
@@ -92,7 +93,53 @@ static const uint8_t ibeam_data[CURSOR_H][CURSOR_W] = {
     {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
     {0,0,0,1,2,2,2,2,1,0,0,0},{0,0,0,1,1,1,1,1,1,0,0,0},
 };
+// Directional resize cursors (same 0=transparent / 1=black-outline / 2=white-fill 12x16
+// box as the arrow, so they share draw_cursor's save/restore path). Double-headed arrows
+// generated to be symmetric; picked by pick_cursor_shape when the pointer is on a resize
+// border. H = ↔ (left/right edges), V = ↕ (top/bottom), NWSE = ⤡ (↖/↘ corners),
+// NESW = ⤢ (↗/↙ corners).
+static const uint8_t cursor_resize_h[CURSOR_H][CURSOR_W] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,1,1,1,1,1,1,0,0,0},{0,0,1,1,2,1,1,2,1,1,0,0},
+    {0,1,1,2,1,1,1,1,2,1,1,0},{1,1,2,1,1,1,1,1,1,2,1,1},
+    {1,2,2,2,2,2,2,2,2,2,2,1},{1,2,2,2,2,2,2,2,2,2,2,1},
+    {1,1,2,1,1,1,1,1,1,2,1,1},{0,1,1,2,1,1,1,1,2,1,1,0},
+    {0,0,1,1,2,1,1,2,1,1,0,0},{0,0,0,1,1,1,1,1,1,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+};
+static const uint8_t cursor_resize_v[CURSOR_H][CURSOR_W] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,1,1,1,1,0,0,0,0},
+    {0,0,0,1,1,2,2,1,1,0,0,0},{0,0,0,1,2,2,2,2,1,0,0,0},
+    {0,0,1,1,2,2,2,2,1,1,0,0},{0,0,1,2,1,2,2,1,2,1,0,0},
+    {0,0,1,1,1,2,2,1,1,1,0,0},{0,0,0,0,1,2,2,1,0,0,0,0},
+    {0,0,0,0,1,2,2,1,0,0,0,0},{0,0,1,1,1,2,2,1,1,1,0,0},
+    {0,0,1,2,1,2,2,1,2,1,0,0},{0,0,1,1,2,2,2,2,1,1,0,0},
+    {0,0,0,1,2,2,2,2,1,0,0,0},{0,0,0,1,1,2,2,1,1,0,0,0},
+    {0,0,0,0,1,1,1,1,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+};
+static const uint8_t cursor_resize_nwse[CURSOR_H][CURSOR_W] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0},{1,1,1,1,1,0,0,0,0,0,0,0},
+    {1,2,2,2,1,0,0,0,0,0,0,0},{1,2,2,1,1,0,0,0,0,0,0,0},
+    {1,1,2,2,1,1,0,0,0,0,0,0},{0,1,1,1,2,1,1,0,0,0,0,0},
+    {0,0,0,1,1,2,1,1,0,0,0,0},{0,0,0,0,1,1,2,1,1,0,0,0},
+    {0,0,0,0,0,1,1,2,1,1,0,0},{0,0,0,0,0,0,1,1,2,1,1,1},
+    {0,0,0,0,0,0,0,1,1,2,2,1},{0,0,0,0,0,0,0,1,1,2,2,1},
+    {0,0,0,0,0,0,0,1,2,2,2,1},{0,0,0,0,0,0,0,1,1,1,1,1},
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+};
+static const uint8_t cursor_resize_nesw[CURSOR_H][CURSOR_W] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,1,1,1,1,1},
+    {0,0,0,0,0,0,0,1,2,2,2,1},{0,0,0,0,0,0,0,1,1,2,2,1},
+    {0,0,0,0,0,0,1,1,2,2,1,1},{0,0,0,0,0,1,1,2,1,1,1,0},
+    {0,0,0,0,1,1,2,1,1,0,0,0},{0,0,0,1,1,2,1,1,0,0,0,0},
+    {0,0,1,1,2,1,1,0,0,0,0,0},{1,1,1,2,1,1,0,0,0,0,0,0},
+    {1,2,2,1,1,0,0,0,0,0,0,0},{1,2,2,1,1,0,0,0,0,0,0,0},
+    {1,2,2,2,1,0,0,0,0,0,0,0},{1,1,1,1,1,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0,0,0},
+};
 static int pick_cursor_shape(int mx, int my);   // defined after window_hit (below)
+static int resize_hit(window_t* win, int mx, int my, int* dir);  // defined below pick
 static uint32_t cursor_bg_buf[CURSOR_H * CURSOR_W];
 static int cursor_saved = 0;
 
@@ -128,10 +175,18 @@ static void draw_cursor(int mx, int my) {
     uint32_t* fb = (uint32_t*)fb_get_addr();
     if (!fb) return;
 
-    // Context cursor: an I-beam over a text window's client area, the arrow otherwise.
-    // The saved/restored 12x16 box is the same for both, so only the bitmap changes.
-    const uint8_t (*glyph)[CURSOR_W] =
-        (pick_cursor_shape(mx, my) == CURSOR_IBEAM) ? ibeam_data : cursor_data;
+    // Context cursor: I-beam over a text window's client area, a directional double-arrow
+    // over a resize border, the arrow otherwise. The saved/restored 12x16 box is the same
+    // for every shape, so only the bitmap changes.
+    const uint8_t (*glyph)[CURSOR_W];
+    switch (pick_cursor_shape(mx, my)) {
+        case CURSOR_IBEAM:        glyph = ibeam_data;         break;
+        case CURSOR_RESIZE_H:     glyph = cursor_resize_h;    break;
+        case CURSOR_RESIZE_V:     glyph = cursor_resize_v;    break;
+        case CURSOR_RESIZE_NWSE:  glyph = cursor_resize_nwse; break;
+        case CURSOR_RESIZE_NESW:  glyph = cursor_resize_nesw; break;
+        default:                  glyph = cursor_data;        break;
+    }
     for (int y = 0; y < CURSOR_H && my + y < (int)fh; y++) {
         for (int x = 0; x < CURSOR_W && mx + x < (int)fw; x++) {
             uint8_t p = glyph[y][x];
@@ -232,6 +287,23 @@ static uint32_t col_lighten(uint32_t c, int pct) {
 static uint32_t col_darken(uint32_t c, int pct) {
     int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
     return fb_rgb(r - r * pct / 100, g - g * pct / 100, b - b * pct / 100);
+}
+
+// The runtime UI accent (declared in theme.h; THEME_ACCENT/THEME_ACCENT_DIM read
+// these). Default = brand purple "Morado" {130,90,210}; apply_nyx_config() sets it
+// from /etc/nyx.conf so a single `accent = <name>` retints the whole desktop chrome.
+uint32_t g_theme_accent     = 0;   // set at desktop start (theme_set_accent); 0 until then
+uint32_t g_theme_accent_dim = 0;
+// Set the UI accent and derive the darker "pressed / frame-lo" shade from it, so every
+// scheme keeps the same light→dark relationship the purple had (28% ≈ the old 130,90,210
+// → 92,64,150 pair). Pure aside from the two globals it writes.
+void theme_set_accent(uint32_t rgb) {
+    g_theme_accent     = rgb;
+    g_theme_accent_dim = col_darken(rgb, 28);
+    // The focused title-bar fill is cached in title_active (set once at compositor_init,
+    // before the config is read); keep it in sync so the whole bar — not just the accent
+    // frame border, which reads THEME_ACCENT live — follows the runtime accent.
+    title_active = rgb;   // == THEME_TITLE_ACTIVE (THEME_ACCENT); title_inactive stays a fixed grey
 }
 
 // A button filled with the same top-lit vertical gradient the title bars use,
@@ -397,9 +469,27 @@ static int window_hit(window_t* win, int mx, int my) {
         && my >= win->y && my < win->y + (int)win_total_h(win);
 }
 
+// The directional double-arrow that signals a resize in `dir` (a RESIZE_* value from
+// resize_hit): left/right -> ↔, top/bottom -> ↕, the two ↖/↘ corners -> \, ↗/↙ -> /.
+static int cursor_for_resize_dir(int dir) {
+    switch (dir) {
+        case RESIZE_LEFT:
+        case RESIZE_RIGHT:        return CURSOR_RESIZE_H;
+        case RESIZE_TOP:
+        case RESIZE_BOTTOM:       return CURSOR_RESIZE_V;
+        case RESIZE_LEFT_TOP:
+        case RESIZE_CORNER:       return CURSOR_RESIZE_NWSE;   // CORNER = right-bottom
+        case RESIZE_RIGHT_TOP:
+        case RESIZE_LEFT_BOTTOM:  return CURSOR_RESIZE_NESW;
+        default:                  return CURSOR_ARROW;
+    }
+}
+
 // Which cursor shape belongs at (mx,my): the topmost window under the pointer decides.
-// Over its CLIENT area (below the title bar) the pointer takes that window's cursor_shape
-// (I-beam for text windows); over the title bar or the bare desktop it stays the arrow.
+// On its resize border the pointer becomes the matching directional double-arrow (exactly
+// where a drag-resize would start — same resize_hit the mouse-down path uses); else over
+// its CLIENT area it takes that window's cursor_shape (I-beam for text windows); over the
+// title bar or the bare desktop it stays the arrow.
 static int pick_cursor_shape(int mx, int my) {
     window_t* top = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -410,6 +500,12 @@ static int pick_cursor_shape(int mx, int my) {
         if (!top || w->z_order > top->z_order) top = w;
     }
     if (!top) return CURSOR_ARROW;
+    // The title-bar strip is a DRAG zone that the mouse-down path checks before resize_hit,
+    // so a top-edge/top-corner resize is intercepted there — don't promise a resize cursor
+    // the click can't deliver. Below the strip, a resize border wins over the client cursor.
+    int dir;
+    if (!titlebar_hit(top, mx, my) && resize_hit(top, mx, my, &dir))
+        return cursor_for_resize_dir(dir);                 // resize border (left/right/bottom)
     if (my >= top->y + TITLE_H) return top->cursor_shape;   // client area
     return CURSOR_ARROW;                                    // title bar
 }
@@ -436,6 +532,42 @@ int cursor_pick_selftest(void) {
         fake.cursor_shape = CURSOR_ARROW;
         if (pick_cursor_shape(150, 100 + TITLE_H + 30)  != CURSOR_ARROW) rc = 13;
     }
+    windows[slot] = NULL;
+    return rc;
+}
+
+// KAT: over a window's resize border the pointer becomes the matching directional arrow,
+// exactly where a drag-resize would start. Same staged-window trick as cursor_pick_selftest.
+// Window at (100,100) 200x150: rx=300, by=100+150+TITLE_H=272, client_top=122, margin=6.
+int cursor_resize_selftest(void) {
+    static window_t fake;
+    memset_asm(&fake, 0, sizeof fake);
+    fake.x = 100; fake.y = 100; fake.w = 200; fake.h = 150;
+    fake.visible = 1; fake.state = WSTATE_NORMAL; fake.z_order = 7;
+    fake.workspace = current_workspace;
+    fake.cursor_shape = CURSOR_IBEAM;   // a text window, so resize must win over the I-beam
+    int slot = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (!windows[i]) { slot = i; break; }
+    if (slot < 0) return 5;
+    windows[slot] = &fake;
+    int rc = 0;
+    // Reachable resize borders (below the title-bar strip) -> the right directional arrow.
+    if      (pick_cursor_shape(297, 200) != CURSOR_RESIZE_H)    rc = 20; // right edge  -> ↔
+    else if (pick_cursor_shape(103, 200) != CURSOR_RESIZE_H)    rc = 21; // left edge   -> ↔
+    else if (pick_cursor_shape(200, 269) != CURSOR_RESIZE_V)    rc = 22; // bottom edge -> ↕
+    else if (pick_cursor_shape(297, 269) != CURSOR_RESIZE_NWSE) rc = 23; // ↘ corner -> NWSE
+    else if (pick_cursor_shape(103, 269) != CURSOR_RESIZE_NESW) rc = 24; // ↙ corner -> NESW
+    // Resize beats the I-beam at the border but NOT in the deep client area.
+    else if (pick_cursor_shape(200, 200) != CURSOR_IBEAM)       rc = 25; // interior    -> I-beam
+    // The title-bar strip is a drag zone: no resize cursor even on its left edge / top band.
+    else if (pick_cursor_shape(103, 110) != CURSOR_ARROW)       rc = 26; // titlebar L edge -> arrow
+    else if (pick_cursor_shape(200, 102) != CURSOR_ARROW)       rc = 27; // top band (drag) -> arrow
+    else if (pick_cursor_shape(400, 400) != CURSOR_ARROW)       rc = 28; // off-window  -> arrow
+    // The dir->shape mapping is exhaustive and correct.
+    else if (cursor_for_resize_dir(RESIZE_TOP)         != CURSOR_RESIZE_V)    rc = 30;
+    else if (cursor_for_resize_dir(RESIZE_LEFT_TOP)    != CURSOR_RESIZE_NWSE) rc = 31;
+    else if (cursor_for_resize_dir(RESIZE_RIGHT_TOP)   != CURSOR_RESIZE_NESW) rc = 32;
+    else if (cursor_for_resize_dir(RESIZE_NONE)        != CURSOR_ARROW)       rc = 33;
     windows[slot] = NULL;
     return rc;
 }
@@ -468,16 +600,14 @@ static int start_hit(int mx, int my) {
 }
 
 static int systray_x(void);   // defined below; the hit-test needs draw_taskbar()'s exact right edge
+static int taskbar_mod_x(void); // left edge of the CPU/RAM module — the button strip stops here
 
 static int taskbar_win_hit(int mx, int my, int* id) {
     uint32_t fh = fb_get_height();
-    // Clamp buttons at the SAME right edge draw_taskbar() uses — systray_x() - 4, which
-    // reserves the system tray + user badge + clock. The old limit here was fw - CLOCK_W - 8,
-    // which reserved only the clock and so sat a tray+badge width further right than the
-    // drawn limit: once a button was clamped the two loops computed different bw, bx drifted,
-    // and clicks in the tray/badge strip (or on undrawn-but-clickable buttons) landed on the
-    // wrong window — exactly the drift the note below says must not happen.
-    int right_limit = systray_x() - 4;
+    // Clamp buttons at the SAME right edge draw_taskbar() uses — taskbar_mod_x() - 4, which
+    // reserves the CPU/RAM module + system tray + user badge + clock. Keeping this identical
+    // to the drawn limit is what stops bx/bw drift (clicks landing on the wrong window).
+    int right_limit = taskbar_mod_x() - 4;
     if (right_limit < 90) right_limit = 90;
     int bx = 90;
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -596,6 +726,7 @@ static int systray_online(void) {
 // sits just left of the user badge. The network icon is LIVE — four accent signal bars
 // when an interface holds an IP, dim bars with a small red mark when offline.
 #define SYSTRAY_W 48
+#define TASKBAR_MOD_W 148   // live CPU%/RAM% status module, just left of the tray
 static void draw_systray(int x, int tb_y) {
     int cy = tb_y + TASKBAR_H / 2;
     fb_fill_rect(x, tb_y + 4, SYSTRAY_W, TASKBAR_H - 8, col_darken(taskbar_bg, 14));  // inset panel
@@ -629,6 +760,10 @@ static int systray_x(void) {
     int ublock_w = av_s + 6 + (int)strlen(g_login_user) * FONT_WIDTH + 10;
     return (int)(fw - CLOCK_W - 8) - ublock_w - SYSTRAY_W;
 }
+
+// Left edge of the live CPU/RAM status module (it sits just left of the system tray). The
+// window-button strip stops here, so draw + hit-test both derive their right edge from it.
+static int taskbar_mod_x(void) { return systray_x() - TASKBAR_MOD_W; }
 
 // Is (mx,my) on the tray's network icon (its left ~half, the four signal bars)?
 static int systray_net_hit(int mx, int my) {
@@ -673,7 +808,7 @@ static void draw_taskbar(void) {
     int av_s = TASKBAR_H - 14;
     int ublock_w = av_s + 6 + (int)strlen(g_login_user) * FONT_WIDTH + 10;
     int tray_x = systray_x();
-    int right_limit = tray_x - 4;
+    int right_limit = taskbar_mod_x() - 4;   // stop the window buttons before the CPU/RAM module
     if (right_limit < 90) right_limit = 90;
 
     int bx = 90;
@@ -707,6 +842,22 @@ static void draw_taskbar(void) {
         bx += bw + 2;
     }
 
+    // Live CPU%/RAM% status module — a rice-style bar readout, refreshed each second with
+    // the clock. Same honest sources as `top` / Nyx Monitor (perf_cpu_percent + mem_pool_kb).
+    {
+        int modx = taskbar_mod_x();
+        uint32_t cpu = perf_cpu_percent();
+        uint32_t mu = 0, mt = 0; mem_pool_kb(&mu, 0, &mt);
+        uint32_t rampct = mt ? (uint32_t)(((uint64_t)mu * 100) / mt) : 0;
+        if (cpu > 100) cpu = 100;
+        if (rampct > 100) rampct = 100;
+        char modbuf[40];
+        snprintf(modbuf, sizeof(modbuf), "CPU %u%% RAM %u%%", cpu, rampct);
+        fb_fill_rect(modx, tb_y + 4, TASKBAR_MOD_W - 4, TASKBAR_H - 8, fb_rgb(30, 30, 35));
+        font_draw_string(modx + 8, tb_y + (TASKBAR_H - FONT_HEIGHT) / 2, modbuf,
+                         fb_rgb(170, 150, 225), fb_rgb(30, 30, 35));   // accent-tinted gauge text
+    }
+
     // System tray (network + speaker status), just left of the user badge.
     draw_systray(tray_x, tb_y);
 
@@ -719,7 +870,9 @@ static void draw_taskbar(void) {
     rtc_time_t rt;
     rtc_read_time(&rt);
     char timebuf[32];
-    date_format(timebuf, sizeof(timebuf), "%a %H:%M  %d/%m", &rt);   // weekday computed by date_format (Sakamoto)
+    // 24-hour by default; nyx.conf `clock = 12h` switches to a 12-hour AM/PM face.
+    const char* clkfmt = g_clock_12h ? "%a %I:%M %p  %d/%m" : "%a %H:%M  %d/%m";
+    date_format(timebuf, sizeof(timebuf), clkfmt, &rt);   // weekday computed by date_format (Sakamoto)
     fb_fill_rect(fw - CLOCK_W - 4, tb_y + 4, CLOCK_W, TASKBAR_H - 8, fb_rgb(30,30,35));
     font_draw_string(fw - CLOCK_W - 2 + (CLOCK_W - strlen(timebuf) * FONT_WIDTH) / 2,
                      tb_y + (TASKBAR_H - FONT_HEIGHT) / 2, timebuf, fb_rgb(180,180,200), fb_rgb(30,30,35));
@@ -1216,7 +1369,7 @@ static void do_ctx_menu_action(int idx) {
             break;
         case 4: // Wallpaper
             {
-                window_t* wwin = window_create(180, 96, 400, 480, "Wallpaper", wallpaper_win_draw);
+                window_t* wwin = window_create(180, 96, 400, 520, "Wallpaper", wallpaper_win_draw);
                 if (wwin) wwin->on_click = wallpaper_win_click;
             }
             break;
@@ -1326,6 +1479,16 @@ static void bg_star_line(int x0, int y0, int x1, int y1, int fw, int fh,
         if (e2 >= dy) { err += dy; x0 += sx; }
         if (e2 <= dx) { err += dx; y0 += sy; }
     }
+}
+
+// Does the current wallpaper style animate (twinkle / meteor / aurora …) — i.e. does the
+// desktop repaint every frame on its own? The drag partial-present falls back to a full
+// present for these, since an animated background changes OUTSIDE the dragged window's rect.
+static int wallpaper_animated(void) {
+    int s = wallpaper_style();
+    return s == WP_STYLE_STARFIELD || s == WP_STYLE_SHOOTINGSTAR || s == WP_STYLE_AURORA ||
+           s == WP_STYLE_NEBULA || s == WP_STYLE_LUCES || s == WP_STYLE_ONDAS ||
+           s == WP_STYLE_LLUVIA;
 }
 
 static void draw_background(void) {
@@ -1676,6 +1839,7 @@ static void draw_background(void) {
 
 static void init_desktop_icons(void);
 static void draw_desktop_icons(void);
+static void draw_desktop_widget(void);   // conky-style live CPU/RAM panel on the wallpaper
 static void settings_draw_fn(window_t* win, int cx, int cy, uint32_t cw, uint32_t ch);
 
 // Drop-shadow geometry. OFFSET is how far down-right the shadow sits; RADIUS is
@@ -1743,6 +1907,7 @@ static void draw_start_menu_shadow(void) {
 
 static void redraw_all(void) {
     draw_background();
+    draw_desktop_widget();   // on the wallpaper, behind windows
     draw_desktop_icons();
 
     window_t* sorted[MAX_WINDOWS];
@@ -1910,6 +2075,7 @@ window_t* compositor_open_editor(const char* path) {
     if (!ewin->reserved) { window_destroy(ewin->id); return NULL; }
     ewin->on_click = editor_win_click;
     ewin->on_key = editor_win_key;
+    ewin->on_close = editor_win_close;   // free the undo snapshots when the window closes
     if (path && path[0]) editor_load_file((editor_win_t*)ewin->reserved, path);
     return ewin;
 }
@@ -3382,6 +3548,106 @@ static void draw_icon_at(int i) {
     font_draw_string(tx, y + ICON_SIZE + 3, desktop_icon_names[i], fb_rgb(230,230,230), fb_rgb(20,25,35));
 }
 
+// --- Live desktop widget (conky-style) --------------------------------------------------
+// An always-on panel on the wallpaper (bottom-right, behind windows) with two stacked live
+// history graphs — CPU% and RAM% — from the same honest sources as top / the taskbar module
+// (perf_cpu_percent + mem_pool_kb). Both scroll every WGT_SAMPLE_MS (motion), refreshed by a
+// partial present of just its rect when no window covers it. CPU uses THEME_ACCENT and RAM a
+// lighter shade, so the widget follows the runtime colorscheme (v6.5.28). Toggle with
+// `widget = on|off` in nyx.conf.
+#define WGT_W        180
+#define WGT_H        124          // two stacked graphs (CPU + RAM)
+#define WGT_MARGIN    16
+#define WGT_N        160          // history samples == graph width in px
+#define WGT_SAMPLE_MS 500u        // sample + scroll cadence
+// Animation partial-present: publish up to this many simultaneously-animating windows' rects
+// (a game + the live monitor + a GIF, or the Nyx Flex tiles) instead of a full-screen blit.
+// Beyond it — or when the combined damage covers most of the screen — a full present is cheaper.
+#define TICK_MAX_RECTS 4
+int g_widget_on = 1;              // set from /etc/nyx.conf (apply_nyx_config); default on
+int g_widget_pos = 0;             // 0=bottom-right (default) 1=bottom-left 2=top-right 3=top-left — nyx.conf `widget_pos`
+static uint8_t wgt_cpu[WGT_N], wgt_ram[WGT_N];
+
+// nyx.conf name <-> index for the widget corner (rice: place the monitor where you like).
+static const char* widget_pos_name(int p) {
+    switch (p) { case 1: return "bottom-left"; case 2: return "top-right"; case 3: return "top-left"; default: return "bottom-right"; }
+}
+static int widget_pos_from_name(const char* s) {
+    if (strcmp(s, "bottom-left")  == 0) return 1;
+    if (strcmp(s, "top-right")    == 0) return 2;
+    if (strcmp(s, "top-left")     == 0) return 3;
+    if (strcmp(s, "bottom-right") == 0) return 0;
+    return -1;   // unknown -> caller keeps the current value
+}
+
+static void wgt_geom(int* x, int* y) {
+    int fw = (int)fb_get_width(), fh = (int)fb_get_height();
+    int left = (g_widget_pos == 1 || g_widget_pos == 3);   // BL / TL hug the left edge
+    int top  = (g_widget_pos == 2 || g_widget_pos == 3);   // TR / TL hug the top edge
+    *x = left ? WGT_MARGIN : (fw - WGT_W - WGT_MARGIN);
+    *y = top  ? WGT_MARGIN : (fh - (int)TASKBAR_H - WGT_H - WGT_MARGIN);  // bottom clears the taskbar
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+}
+
+static uint32_t wgt_ram_pct(void) {
+    uint32_t mu = 0, mt = 0; mem_pool_kb(&mu, 0, &mt);
+    return mt ? (uint32_t)(((uint64_t)mu * 100) / mt) : 0;
+}
+
+// Push the current CPU% + RAM% and scroll both histories one sample left (newest at right).
+static void wgt_push_sample(void) {
+    uint32_t c = perf_cpu_percent(); if (c > 100) c = 100;
+    uint32_t r = wgt_ram_pct();      if (r > 100) r = 100;
+    for (int i = 1; i < WGT_N; i++) { wgt_cpu[i - 1] = wgt_cpu[i]; wgt_ram[i - 1] = wgt_ram[i]; }
+    wgt_cpu[WGT_N - 1] = (uint8_t)c;
+    wgt_ram[WGT_N - 1] = (uint8_t)r;
+}
+
+// Does any visible window overlap the widget's rect? (If so, skip its partial repaint — it
+// is hidden behind the window, and a full recomposite redraws it when the window moves.)
+static int widget_covered(void) {
+    int wx, wy; wgt_geom(&wx, &wy);
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t* w = windows[i];
+        if (!w || !w->visible || w->state == WSTATE_MINIMIZED || w->workspace != current_workspace) continue;
+        int rx = w->x, ry = w->y, rw = (int)w->w, rh = (int)win_total_h(w);
+        if (rx < wx + WGT_W && rx + rw > wx && ry < wy + WGT_H && ry + rh > wy) return 1;
+    }
+    return 0;
+}
+
+// Draw one labelled history graph: a dark inset, a 50% grid line, and WGT_N bars rising from
+// the baseline in `color`, with a "LABEL nn%" caption above it.
+static void wgt_draw_graph(int x, int y, const char* label, uint32_t pct, const uint8_t* series, uint32_t color) {
+    char cap[24]; snprintf(cap, sizeof cap, "%s %u%%", label, pct);
+    font_draw_string_trans(x, y, cap, fb_rgb(212, 206, 228));
+    int gx = x, gy = y + 14, gw = WGT_N, gh = 38;
+    fb_fill_rect(gx, gy, gw, gh, fb_rgb(14, 14, 18));
+    fb_fill_rect(gx, gy + gh / 2, gw, 1, fb_rgb(42, 42, 52));   // 50% grid line
+    for (int i = 0; i < WGT_N; i++) {
+        int v = series[i];
+        int bh = v * gh / 100; if (bh < 1 && v > 0) bh = 1; if (bh > gh) bh = gh;
+        if (bh > 0) fb_fill_rect(gx + i, gy + gh - bh, 1, bh, color);
+    }
+}
+
+static void draw_desktop_widget(void) {
+    if (!g_widget_on) return;
+    int x, y; wgt_geom(&x, &y);
+    // Opaque panel + accent frame, so a partial repaint over its own rect is self-contained.
+    fb_fill_rect(x, y, WGT_W, WGT_H, fb_rgb(24, 24, 30));
+    fb_fill_rect(x, y, WGT_W, 1, THEME_ACCENT);
+    fb_fill_rect(x, y + WGT_H - 1, WGT_W, 1, col_darken(THEME_ACCENT, 45));
+    fb_fill_rect(x, y, 1, WGT_H, col_darken(THEME_ACCENT, 20));
+    fb_fill_rect(x + WGT_W - 1, y, 1, WGT_H, col_darken(THEME_ACCENT, 45));
+    uint32_t cpu = perf_cpu_percent(); if (cpu > 100) cpu = 100;
+    // Two stacked live graphs: CPU in the accent, RAM in a lighter shade of it (both follow
+    // the runtime colorscheme). Each scrolls every WGT_SAMPLE_MS → the motion the rice wants.
+    wgt_draw_graph(x + 10, y + 6,  "CPU", cpu,           wgt_cpu, THEME_ACCENT);
+    wgt_draw_graph(x + 10, y + 64, "RAM", wgt_ram_pct(), wgt_ram, col_lighten(THEME_ACCENT, 35));
+}
+
 static void draw_desktop_icons(void) {
     if (!g_desktop_icons_visible) return;  // minimal desktop — apps live in the Start menu
     for (int i = 0; i < NUM_DESKTOP_ICONS; i++) {
@@ -3389,6 +3655,67 @@ static void draw_desktop_icons(void) {
         draw_icon_at(i);
     }
     if (drag_icon_idx >= 0) draw_icon_at(drag_icon_idx);
+}
+
+// Rice config foundation (v6.5.23): read /etc/nyx.conf at desktop start and apply the
+// desktop settings it names. A missing file or unknown value just leaves the defaults, so
+// the desktop always comes up. Currently drives the wallpaper style + accent color; future
+// keys (font, taskbar, gaps…) hang off the same parser.
+static void apply_nyx_config(void) {
+    theme_set_accent(fb_rgb(130, 90, 210));     // Morado default UI accent (may be overridden below)
+    int fd = vfs_open("/etc/nyx.conf", 0, 0);   // O_RDONLY; -1 if absent
+    if (fd < 0) return;
+    static char buf[2048];
+    int n = vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    char val[64];
+    if (nyxconf_get(buf, "wallpaper", val, sizeof val)) {
+        int s = wallpaper_style_from_name(val);
+        if (s >= 0) wallpaper_set_style(s);
+    }
+    if (nyxconf_get(buf, "accent", val, sizeof val)) {
+        int c = wallpaper_color_from_name(val);
+        if (c >= 0) {
+            wallpaper_set_color(c);                 // the wallpaper base color…
+            theme_set_accent(wallpaper_base_color()); // …AND the whole UI chrome, cohesively
+        }
+    }
+    if (nyxconf_get(buf, "widget", val, sizeof val)) {
+        // live desktop CPU/RAM widget: any of off/0/false/no disables it (default on)
+        g_widget_on = !(strcmp(val, "off") == 0 || strcmp(val, "0") == 0 ||
+                        strcmp(val, "false") == 0 || strcmp(val, "no") == 0);
+    }
+    if (nyxconf_get(buf, "widget_pos", val, sizeof val)) {
+        int p = widget_pos_from_name(val);          // which corner the monitor widget hugs
+        if (p >= 0) g_widget_pos = p;               // unknown name -> keep the default corner
+    }
+    if (nyxconf_get(buf, "clock", val, sizeof val)) {
+        g_clock_12h = (strcmp(val, "12h") == 0 || strcmp(val, "12") == 0);   // else 24-hour
+    }
+}
+
+// Write the current theme (wallpaper style + accent color + widget state) back to
+// /etc/nyx.conf, so a change made in the GUI (the Wallpaper theme picker) persists across
+// reboots — apply_nyx_config reads it at desktop start. The inverse of apply_nyx_config.
+void save_nyx_config(void) {
+    char buf[256];
+    int n = snprintf(buf, sizeof buf,
+        "# NyxOS desktop config -- rice it here (also editable from the Wallpaper picker).\n"
+        "wallpaper = %s\n"
+        "accent = %s\n"
+        "widget = %s\n"
+        "widget_pos = %s\n"
+        "clock = %s\n",
+        wallpaper_style_name(wallpaper_style()),
+        wallpaper_color_name(wallpaper_color()),
+        g_widget_on ? "on" : "off",
+        widget_pos_name(g_widget_pos),
+        g_clock_12h ? "12h" : "24h");
+    if (n <= 0) return;
+    int fd = vfs_open("/etc/nyx.conf", O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { vfs_write(fd, buf, (size_t)n); vfs_close(fd); }
 }
 
 static void draw_welcome_windows(void) {
@@ -3462,6 +3789,7 @@ void compositor_run(void) {
     uint8_t prev_btns = 0;
     ss_last_activity = get_ticks(); screensaver_active = 0;   // start the idle timer fresh
 
+    apply_nyx_config();          // rice: /etc/nyx.conf picks the wallpaper/accent before first paint
     draw_welcome_windows();
     redraw_all();
     save_cursor_bg(mouse_x, mouse_y);
@@ -3470,8 +3798,13 @@ void compositor_run(void) {
     frame_dirty = 0;
     int redraw = 0;
     uint32_t clock_tick = 0;
+    // Window-drag partial present: the drag handler records the damaged region (old ∪ new
+    // window footprint, incl. drop shadow) each move so the present publishes just that rect
+    // instead of the whole 3 MB screen. Reset every iteration.
+    int drag_dmg_valid = 0, ddx = 0, ddy = 0, ddw = 0, ddh = 0;
     extern volatile int kbd_head, kbd_tail;
     while (!quit) {
+        drag_dmg_valid = 0;   // recomputed by the drag handler each iteration
         // Idle-yield: when nothing is happening — no key queued, no mouse button
         // held, the pointer hasn't moved, and no drag/resize/menu is active — sleep
         // briefly instead of busy-polling, so background jobs (or the CPU itself)
@@ -3550,6 +3883,10 @@ void compositor_run(void) {
         if (my >= (int)fh) my = fh - 1;
 
         // Dispatch mouse-move to focused window
+        // Did a hover handler run this frame? If so, the focused window may have painted
+        // into the back buffer without setting `redraw`, so the finished frame must be
+        // published in full — the cursor-only fast present below would miss it.
+        int mm_dispatched = 0;
         if (mx != mouse_x || my != mouse_y) {
             window_t* fwin = NULL;
             for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -3558,8 +3895,10 @@ void compositor_run(void) {
                     break;
                 }
             }
-            if (fwin && fwin->on_mousemove)
+            if (fwin && fwin->on_mousemove) {
                 fwin->on_mousemove(fwin, mx, my, btns);
+                mm_dispatched = 1;
+            }
         }
 
         // Dispatch mouse-wheel notches to the focused window as synthetic scroll keys
@@ -3688,12 +4027,25 @@ void compositor_run(void) {
             } else if (drag_id) {
                 window_t* win = find_window(drag_id);
                 if (win) {
+                    // Record the old footprint, move, record the new one → the damaged region
+                    // is their union (+ a margin covering the frame + drop shadow). The present
+                    // section blits just this rect instead of the whole screen.
+                    int oax = win->x, oay = win->y, oaw = (int)win->w, oah = (int)win_total_h(win);
                     window_move(drag_id, mx - win->drag_off_x, my - win->drag_off_y);
+                    int nbx = win->x, nby = win->y, nbw = (int)win->w, nbh = (int)win_total_h(win);
+                    const int M = SHADOW_OFFSET + SHADOW_RADIUS + 2;
+                    int x0 = (oax < nbx ? oax : nbx) - M;
+                    int y0 = (oay < nby ? oay : nby) - M;
+                    int x1 = ((oax + oaw) > (nbx + nbw) ? (oax + oaw) : (nbx + nbw)) + M;
+                    int y1 = ((oay + oah) > (nby + nbh) ? (oay + oah) : (nby + nbh)) + M;
+                    ddx = x0; ddy = y0; ddw = x1 - x0; ddh = y1 - y0; drag_dmg_valid = 1;
                     redraw = 1;
                 }
             } else if (resize_id) {
                 window_t* win = find_window(resize_id);
                 if (win) {
+                    // Footprint BEFORE this step (for the partial-present damage rect below).
+                    int oax = win->x, oay = win->y, oaw = (int)win->w, oah = (int)win_total_h(win);
                     int dx = mx - win->resize_start_x;
                     int dy = my - win->resize_start_y;
                     int nx = win->x, ny = win->y;
@@ -3726,6 +4078,16 @@ void compositor_run(void) {
                     if ((int)nh < MIN_WIN_H) { nh = MIN_WIN_H; ny = win->y; }
                     win->x = nx; win->y = ny;
                     window_resize(resize_id, nw, nh);
+                    // Damage = old ∪ new footprint (+ shadow margin). The union covers both a
+                    // grow (new bigger) and a shrink (old bigger → the vacated area repaints),
+                    // so the present publishes just this rect instead of the whole screen.
+                    int nbx = win->x, nby = win->y, nbw = (int)win->w, nbh = (int)win_total_h(win);
+                    const int M = SHADOW_OFFSET + SHADOW_RADIUS + 2;
+                    int x0 = (oax < nbx ? oax : nbx) - M;
+                    int y0 = (oay < nby ? oay : nby) - M;
+                    int x1 = ((oax + oaw) > (nbx + nbw) ? (oax + oaw) : (nbx + nbw)) + M;
+                    int y1 = ((oay + oah) > (nby + nbh) ? (oay + oah) : (nby + nbh)) + M;
+                    ddx = x0; ddy = y0; ddw = x1 - x0; ddh = y1 - y0; drag_dmg_valid = 1;
                     redraw = 1;
                 }
             } else {
@@ -4103,6 +4465,7 @@ void compositor_run(void) {
 
 done_click:
 
+        int old_cx = mouse_x, old_cy = mouse_y;   // where the cursor started this frame
         int moved = (mx != mouse_x || my != mouse_y);
         mouse_x = mx; mouse_y = my;
         mouse_btns = btns;
@@ -4113,20 +4476,36 @@ done_click:
         if (moved && (start_menu_open || ctx_menu_open || user_menu_open)) redraw = 1;
 
         uint32_t now = get_ticks();
+        int taskbar_only = 0;
+        int widget_only = 0;
         if (now - clock_tick > 1000) {
             clock_tick = now;
-            redraw = 1;
+            // The clock + CPU/RAM module tick every second. Don't recomposite the WHOLE
+            // screen for that — flag a taskbar-only refresh (repaint just the strip +
+            // fb_present_rect it below). If a full frame is already happening this
+            // iteration, frame_dirty wins and the taskbar refreshes with it.
+            taskbar_only = 1;
         }
 
         // Periodic tick (~30 fps): drive any window that registered an on_tick (the games'
         // animation, Selene's cooperative image loader). Each handler returns 1 only when it
         // changed something, so an idle Selene window doesn't force a 30fps recomposite.
         static uint32_t game_tick_ms = 0;
+        // Snapshot whether anything EARLIER this frame (a click, key, drag, resize) already asked
+        // for a full redraw, and count how many windows the tick actually changes. When the SOLE
+        // dirty source turns out to be exactly one animating window, the present below publishes
+        // just that window's rect (see tick_partial) instead of the whole ~3 MB screen.
+        int redraw_pre_tick = redraw;
+        int tick_changed = 0, tick_idx[TICK_MAX_RECTS];
         if (now - game_tick_ms >= 33) {
             game_tick_ms = now;
             for (int gi = 0; gi < MAX_WINDOWS; gi++)
                 if (windows[gi] && windows[gi]->on_tick && windows[gi]->visible) {
-                    if (windows[gi]->on_tick(windows[gi])) redraw = 1;
+                    if (windows[gi]->on_tick(windows[gi])) {
+                        redraw = 1;
+                        if (tick_changed < TICK_MAX_RECTS) tick_idx[tick_changed] = gi;
+                        tick_changed++;   // total; only the first TICK_MAX_RECTS are recorded
+                    }
                 }
         }
 
@@ -4137,11 +4516,7 @@ done_click:
         static uint32_t wp_anim_ms = 0;
         int wp_st = wallpaper_style();
         uint32_t wp_iv = (wp_st == WP_STYLE_SHOOTINGSTAR || wp_st == WP_STYLE_LLUVIA) ? 70u : 120u;
-        if ((wp_st == WP_STYLE_STARFIELD || wp_st == WP_STYLE_SHOOTINGSTAR ||
-             wp_st == WP_STYLE_AURORA || wp_st == WP_STYLE_NEBULA ||
-             wp_st == WP_STYLE_LUCES || wp_st == WP_STYLE_ONDAS ||
-             wp_st == WP_STYLE_LLUVIA) &&
-            now - wp_anim_ms >= wp_iv) {
+        if (wallpaper_animated() && now - wp_anim_ms >= wp_iv) {   // one animated-style list (drag partial uses it too)
             wp_anim_ms = now;
             redraw = 1;
         }
@@ -4153,6 +4528,7 @@ done_click:
         static uint32_t notify_anim_ms = 0;
         static int notify_was_active = 0;
         int notify_now_active = notify_active_count(now) > 0;
+        int toast_just_expired = (!notify_now_active && notify_was_active);  // this frame erases a toast → area outside a window changes → force a full present
         if ((notify_now_active && now - notify_anim_ms >= 100u) ||
             (!notify_now_active && notify_was_active)) {
             notify_anim_ms = now;
@@ -4160,9 +4536,23 @@ done_click:
         }
         notify_was_active = notify_now_active;
 
+        // Live desktop widget: sample CPU% and scroll the graph every WGT_SAMPLE_MS. If a
+        // full recomposite is already happening (redraw) it repaints with the frame; else,
+        // when the widget isn't covered by a window, flag a widget-only partial repaint (its
+        // ~180x76 rect, not the whole screen) so the graph animates without a full present.
+        static uint32_t wgt_ms = 0;
+        if (g_widget_on && now - wgt_ms >= WGT_SAMPLE_MS) {
+            wgt_ms = now;
+            wgt_push_sample();
+            if (!redraw && !widget_covered()) widget_only = 1;
+        }
+
         if (redraw) {
             redraw_all();
             redraw = 0;
+        } else {
+            if (taskbar_only) draw_taskbar();   // idle clock/module refresh: taskbar strip only
+            if (widget_only)  draw_desktop_widget();
         }
 
         // A fullscreen userspace app (SYS_FBPRESENT) owns the screen and fb_present()
@@ -4176,10 +4566,96 @@ done_click:
 
         save_cursor_bg(mouse_x, mouse_y);
         draw_cursor(mouse_x, mouse_y);
-        // Publish the finished frame in one blit — only when something actually
-        // changed (a recomposite happened, or the pointer moved) so an idle
-        // desktop doesn't pointlessly copy the whole framebuffer every wakeup.
-        if (frame_dirty || moved) { fb_present(); frame_dirty = 0; }
+        // Publish the finished frame. A recomposite (or a hover handler that may have
+        // painted) needs the whole screen. But when ONLY the pointer moved, blit just its
+        // old + new 12x16 rects instead of the entire ~3 MB back buffer — a full fb_present
+        // to move the cursor one step was the single biggest per-frame cost (measured
+        // ~3.4 ms vs microseconds for the two small rects), so pointer motion is now free.
+        if (frame_dirty || (moved && mm_dispatched)) {
+            // Window drag OR resize: publish just the affected window's damaged region (old ∪
+            // new footprint) instead of a full ~3 MB blit. Fall back to a full present whenever
+            // something OUTSIDE that rect could also have changed — a drop-snap hint at the
+            // screen edge (drags only; a resize never shows one), an animated wallpaper, a live
+            // toast, or an open menu — so nothing is left stale. redraw_all still rebuilt the
+            // whole back buffer; only the PUBLISH shrinks.
+            int snap_showing = drag_id &&
+                snap_zone_for_cursor(mouse_x, mouse_y, (int)fw, (int)fh) != WSTATE_NORMAL;
+            int drag_partial = drag_dmg_valid && (drag_id || resize_id) && frame_dirty
+                && !fb_fullscreen_active() && !snap_showing
+                && !wallpaper_animated() && notify_active_count(now) == 0
+                && !start_menu_open && !ctx_menu_open && !user_menu_open;
+
+            // Single-window animation partial present: when the ONLY dirty source this frame is
+            // exactly one window's on_tick — a game, an animated GIF, the live CPU/RAM graph — and
+            // nothing else could have changed outside it (no earlier click/key/drag/resize, no
+            // animated wallpaper, no live-or-expiring toast, no open menu), publish just that
+            // window's footprint (frame + drop shadow) rather than the whole ~3 MB screen.
+            // redraw_all still rebuilt the whole back buffer; only the PUBLISH shrinks — the same
+            // lever as the drag (.32) / resize (.35) paths, now covering the last frequent full
+            // present. on_tick handlers animate CONTENT inside a fixed window (never move/resize
+            // it), so the current footprint IS the whole damage region — no old∪new union needed.
+            // Generalised from one window (.39) to up to TICK_MAX_RECTS: collect each ticked
+            // window's footprint into a rect list. The blit cost is ~linear in pixels, so N rects
+            // beat a full present as long as their COMBINED area stays well under the whole screen
+            // — guard on that (else 3-4 near-fullscreen windows would blit MORE than one full frame).
+            int tick_partial = 0, tprn = 0;
+            int tprx[TICK_MAX_RECTS], tpry[TICK_MAX_RECTS], tprw[TICK_MAX_RECTS], tprh[TICK_MAX_RECTS];
+            if (!drag_partial && frame_dirty && redraw_pre_tick == 0
+                && tick_changed >= 1 && tick_changed <= TICK_MAX_RECTS
+                && !drag_id && !resize_id && !taskbar_only && !widget_only
+                && !fb_fullscreen_active() && !wallpaper_animated()
+                && notify_active_count(now) == 0 && !toast_just_expired
+                && !start_menu_open && !ctx_menu_open && !user_menu_open) {
+                const int M = SHADOW_OFFSET + SHADOW_RADIUS + 2;
+                long area = 0;
+                for (int t = 0; t < tick_changed; t++) {
+                    window_t* tw = windows[tick_idx[t]];
+                    if (!tw || !tw->visible || tw->state == WSTATE_MINIMIZED) continue;
+                    int x0 = tw->x - M, y0 = tw->y - M;
+                    int x1 = tw->x + (int)tw->w + M, y1 = tw->y + (int)win_total_h(tw) + M;
+                    if (x0 < 0) x0 = 0;
+                    if (y0 < 0) y0 = 0;
+                    if (x1 > (int)fw) x1 = (int)fw;
+                    if (y1 > (int)fh) y1 = (int)fh;
+                    if (x1 - x0 > 0 && y1 - y0 > 0) {
+                        tprx[tprn] = x0; tpry[tprn] = y0; tprw[tprn] = x1 - x0; tprh[tprn] = y1 - y0;
+                        area += (long)(x1 - x0) * (y1 - y0);
+                        tprn++;
+                    }
+                }
+                // Only publish rects when they cover clearly less than the whole screen (85%).
+                if (tprn >= 1 && area < (long)fw * (long)fh * 85 / 100) tick_partial = 1;
+            }
+
+            if (drag_partial) {
+                fb_present_rect(ddx, ddy, ddw, ddh);
+                if (moved) {   // cursor may sit outside the window rect near a clamped edge
+                    fb_present_rect(old_cx, old_cy, CURSOR_W, CURSOR_H);
+                    fb_present_rect(mouse_x, mouse_y, CURSOR_W, CURSOR_H);
+                }
+            } else if (tick_partial) {
+                for (int t = 0; t < tprn; t++) fb_present_rect(tprx[t], tpry[t], tprw[t], tprh[t]);
+                if (moved) {   // the pointer may have moved this frame too — publish its rects
+                    fb_present_rect(old_cx, old_cy, CURSOR_W, CURSOR_H);
+                    fb_present_rect(mouse_x, mouse_y, CURSOR_W, CURSOR_H);
+                }
+            } else {
+                fb_present();
+            }
+            frame_dirty = 0;
+        } else if (taskbar_only || widget_only) {
+            // publish just the taskbar strip and/or the widget rect (each far smaller than
+            // the full screen), plus the cursor's rects if it also moved this tick
+            if (taskbar_only) fb_present_rect(0, (int)(fh - TASKBAR_H), (int)fw, TASKBAR_H);
+            if (widget_only) { int wx, wy; wgt_geom(&wx, &wy); fb_present_rect(wx, wy, WGT_W, WGT_H); }
+            if (moved) {
+                fb_present_rect(old_cx, old_cy, CURSOR_W, CURSOR_H);
+                fb_present_rect(mouse_x, mouse_y, CURSOR_W, CURSOR_H);
+            }
+        } else if (moved) {
+            fb_present_rect(old_cx, old_cy, CURSOR_W, CURSOR_H);   // erase the old cursor
+            fb_present_rect(mouse_x, mouse_y, CURSOR_W, CURSOR_H); // draw the new one
+        }
         for (int d = 0; d < 100000; d++) __asm__ volatile("pause");
     }
 

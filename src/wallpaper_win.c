@@ -2,6 +2,12 @@
 #include "compositor.h"
 #include "wallpaper_win.h"
 #include "../../drivers/video/font.h"
+#include "theme.h"                 // THEME_ACCENT — the runtime UI accent, for cohesive highlights
+
+// The live desktop widget's state lives in compositor.c; the picker's "Panel:" row reads it to
+// show the current corner and writes it (+ save_nyx_config) when a button is clicked (v6.5.42).
+extern int g_widget_on;            // 1 = the CPU/RAM panel is shown
+extern int g_widget_pos;           // 0=bottom-right 1=bottom-left 2=top-right 3=top-left
 
 // The 11 wallpaper base colors. Index 0 is the NyxOS brand purple (morado) — the
 // default. draw_background() (compositor.c) builds a vertical gradient from a darker
@@ -37,6 +43,28 @@ int wallpaper_style(void) {
     return g_style;
 }
 
+// Setters + name lookups so /etc/nyx.conf (the rice config) can pick the wallpaper by name
+// (v6.5.23). Out-of-range is ignored; an unknown name returns -1 so the caller keeps the default.
+void wallpaper_set_style(int style) { if (style >= 0 && style < WP_STYLE_COUNT) g_style = style; }
+void wallpaper_set_color(int idx)   { if (idx   >= 0 && idx   < WALLPAPER_COUNT) g_wallpaper = idx; }
+int wallpaper_color(void)           { return g_wallpaper; }   // current base-color index
+// Index -> name, for writing /etc/nyx.conf back from the GUI (save_nyx_config). Out-of-range
+// falls back to the default names so a bad index never yields a NULL into snprintf.
+const char* wallpaper_style_name(int i) { return (i >= 0 && i < WP_STYLE_COUNT)  ? style_names[i] : "Nightfall"; }
+const char* wallpaper_color_name(int i) { return (i >= 0 && i < WALLPAPER_COUNT) ? palette[i].name : "Morado"; }
+int wallpaper_style_from_name(const char* name) {
+    if (!name) return -1;
+    for (int i = 0; i < WP_STYLE_COUNT; i++)
+        if (strcmp(style_names[i], name) == 0) return i;
+    return -1;
+}
+int wallpaper_color_from_name(const char* name) {
+    if (!name) return -1;
+    for (int i = 0; i < WALLPAPER_COUNT; i++)
+        if (strcmp(palette[i].name, name) == 0) return i;
+    return -1;
+}
+
 // Style-button grid geometry (top of the content; shared by draw + click). Twelve
 // styles now, laid out 4 per row over 3 rows (the 3rd row is Ondas/Astral/Lluvia/Cordillera).
 #define WP_STYLE_COLS 4
@@ -58,6 +86,25 @@ int wallpaper_style(void) {
 #define WP_OX     16     // grid origin x within the content
 #define WP_OY     158    // grid origin y within the content (below the 3-row style grid)
 #define WP_ROW_H  (WP_SH + 22 + WP_GAP)   // swatch + label + gap
+
+// "Panel:" widget-corner control row (below the color grid). Five buttons: Off + the four
+// corners; picking a corner also turns the panel on. wg_pos[i] = the g_widget_pos value the
+// button selects, or -1 for Off. The current choice is highlighted in the runtime accent.
+#define WP_WG_OY   420
+#define WP_WG_BW   58
+#define WP_WG_BH   24
+#define WP_WG_GAP  5
+#define WP_WG_BX   64                       // first button x (after the "Panel:" label)
+#define WP_WG_X(i) (WP_WG_BX + (i) * (WP_WG_BW + WP_WG_GAP))
+static const char* wg_labels[5] = { "Off", "BR", "BL", "TR", "TL" };
+static const int   wg_pos[5]    = {  -1,    0,    1,    2,    3  };
+
+// "Reset to defaults" button (below the Panel row): restores the seeded rice —
+// Nightfall wallpaper, Morado accent, panel on in the bottom-right — and persists it.
+#define WP_RST_OY  456
+#define WP_RST_X   16
+#define WP_RST_W   168
+#define WP_RST_H   26
 
 // Fill a disc clipped to the rect [clx,cly,clw,clh) — a tiny moon for the preview
 // swatches (bg_fill_circle lives in compositor.c and isn't visible here).
@@ -240,7 +287,7 @@ void wallpaper_win_draw(window_t* win, int cx, int cy, uint32_t cw, uint32_t ch)
         int x = cx + WP_STYLE_X(i);
         int y = cy + WP_STYLE_Y(i);
         int sel = (i == g_style);
-        uint32_t fill = sel ? fb_rgb(130, 90, 210) : fb_rgb(48, 48, 58);
+        uint32_t fill = sel ? THEME_ACCENT : fb_rgb(48, 48, 58);   // selected = the runtime accent, not a fixed purple
         fb_fill_rect(x, y, WP_STYLE_BW, WP_STYLE_BH, fill);
         uint32_t fr = sel ? fb_rgb(255, 255, 255) : fb_rgb(80, 80, 92);
         fb_fill_rect(x, y, WP_STYLE_BW, 1, fr);                    // top
@@ -266,6 +313,38 @@ void wallpaper_win_draw(window_t* win, int cx, int cy, uint32_t cw, uint32_t ch)
         font_draw_string(x + (WP_SW - nlen) / 2, y + WP_SH + 4, palette[i].name,
                          i == g_wallpaper ? fb_rgb(255, 255, 255) : fb_rgb(175, 175, 185), bg);
     }
+
+    // --- Panel row: where the live CPU/RAM widget sits (or Off) ---------------
+    font_draw_string(cx + 12, cy + WP_WG_OY + (WP_WG_BH - FONT_HEIGHT) / 2, "Panel:", fb_rgb(230, 230, 240), bg);
+    for (int i = 0; i < 5; i++) {
+        int x = cx + WP_WG_X(i), y = cy + WP_WG_OY;
+        int sel = (wg_pos[i] < 0) ? !g_widget_on : (g_widget_on && g_widget_pos == wg_pos[i]);
+        uint32_t fill = sel ? THEME_ACCENT : fb_rgb(48, 48, 58);
+        fb_fill_rect(x, y, WP_WG_BW, WP_WG_BH, fill);
+        uint32_t fr = sel ? fb_rgb(255, 255, 255) : fb_rgb(80, 80, 92);
+        fb_fill_rect(x, y, WP_WG_BW, 1, fr);
+        fb_fill_rect(x, y + WP_WG_BH - 1, WP_WG_BW, 1, fr);
+        fb_fill_rect(x, y, 1, WP_WG_BH, fr);
+        fb_fill_rect(x + WP_WG_BW - 1, y, 1, WP_WG_BH, fr);
+        int nlen = (int)strlen(wg_labels[i]) * FONT_WIDTH;
+        font_draw_string(x + (WP_WG_BW - nlen) / 2, y + (WP_WG_BH - FONT_HEIGHT) / 2, wg_labels[i],
+                         sel ? fb_rgb(255, 255, 255) : fb_rgb(200, 200, 210), fill);
+    }
+
+    // --- Reset button: one click back to the seeded defaults ------------------
+    {
+        int x = cx + WP_RST_X, y = cy + WP_RST_OY;
+        fb_fill_rect(x, y, WP_RST_W, WP_RST_H, fb_rgb(58, 48, 62));
+        uint32_t fr = fb_rgb(96, 84, 104);
+        fb_fill_rect(x, y, WP_RST_W, 1, fr);
+        fb_fill_rect(x, y + WP_RST_H - 1, WP_RST_W, 1, fr);
+        fb_fill_rect(x, y, 1, WP_RST_H, fr);
+        fb_fill_rect(x + WP_RST_W - 1, y, 1, WP_RST_H, fr);
+        const char* lbl = "Reset to defaults";
+        int nlen = (int)strlen(lbl) * FONT_WIDTH;
+        font_draw_string(x + (WP_RST_W - nlen) / 2, y + (WP_RST_H - FONT_HEIGHT) / 2, lbl,
+                         fb_rgb(225, 225, 235), fb_rgb(58, 48, 62));
+    }
 }
 
 void wallpaper_win_click(window_t* win, int mx, int my, int btn) {
@@ -278,17 +357,46 @@ void wallpaper_win_click(window_t* win, int mx, int my, int btn) {
         int y = cy + WP_STYLE_Y(i);
         if (mx >= x && mx < x + WP_STYLE_BW && my >= y && my < y + WP_STYLE_BH) {
             g_style = i;                      // the compositor repaints (incl. the background)
+            save_nyx_config();                // persist the choice to /etc/nyx.conf
             return;
         }
     }
 
-    // Color grid hit-test.
+    // Color grid hit-test. Picking a color sets the wallpaper base AND retints the whole UI
+    // accent (title bars / taskbar / menus), matching nyx.conf's `accent` — so the picker is
+    // a live THEME switcher, not just a wallpaper tint. Then persist the choice.
     for (int i = 0; i < WALLPAPER_COUNT; i++) {
         int col = i % WP_COLS, row = i / WP_COLS;
         int x = cx + WP_OX + col * (WP_SW + WP_GAP);
         int y = cy + WP_OY + row * WP_ROW_H;
         if (mx >= x && mx < x + WP_SW && my >= y && my < y + WP_SH) {
             g_wallpaper = i;                  // the compositor repaints (incl. the background)
+            theme_set_accent(wallpaper_base_color());
+            save_nyx_config();
+            return;
+        }
+    }
+
+    // Panel row hit-test: Off, or one of the four corners (which also turns the panel on).
+    for (int i = 0; i < 5; i++) {
+        int x = cx + WP_WG_X(i), y = cy + WP_WG_OY;
+        if (mx >= x && mx < x + WP_WG_BW && my >= y && my < y + WP_WG_BH) {
+            if (wg_pos[i] < 0) g_widget_on = 0;
+            else { g_widget_on = 1; g_widget_pos = wg_pos[i]; }
+            save_nyx_config();                // persist; the compositor repaints on this click
+            return;
+        }
+    }
+
+    // Reset button: back to the seeded defaults (Nightfall / Morado / panel on, bottom-right).
+    {
+        int x = cx + WP_RST_X, y = cy + WP_RST_OY;
+        if (mx >= x && mx < x + WP_RST_W && my >= y && my < y + WP_RST_H) {
+            g_style = WP_STYLE_NIGHTFALL;
+            g_wallpaper = 0;                      // Morado (brand purple), index 0
+            theme_set_accent(wallpaper_base_color());
+            g_widget_on = 1; g_widget_pos = 0;    // panel on, bottom-right
+            save_nyx_config();
             return;
         }
     }
