@@ -55,6 +55,10 @@ static int ctx_menu_x = 0, ctx_menu_y = 0;
 static int cal_popup_open = 0;      // the taskbar clock's calendar popup
 static int g_clock_12h = 0;         // taskbar clock: 0 = 24-hour (default), 1 = 12-hour AM/PM — nyx.conf `clock`
 static int g_gaps      = 0;         // WM gaps (px) inset around + between snapped/maximized tiles — nyx.conf `gaps` (0 = classic tiling, off)
+static uint32_t g_border_color = 0; // focused-window outline override — nyx.conf `border` (0 = follow the UI accent)
+static int g_panel_tint = 0;        // taskbar tint toward the wallpaper colour, 0-100% — nyx.conf `panel_tint` (0 = off)
+static int g_shadows   = 1;         // window + start-menu drop shadows — nyx.conf `shadow` (off = flat, no shadows)
+static int g_title_center = 0;      // title-bar text alignment — nyx.conf `title_align` (0 = left default, 1 = center)
 static int net_popup_open = 0;      // the system tray's network-status popup
 static int spk_popup_open = 0;      // the system tray's sound/volume popup
 static int g_volume = 75;           // master volume 0..100 (persisted while running)
@@ -250,6 +254,11 @@ static void draw_max_button(int x, int y, int size, uint32_t color) {
 
 // Corner-rounding radius for window title bars.
 #define WIN_RADIUS 7
+#define WIN_RADIUS_MAX 14                   // rice clamp for the nyx.conf `rounding` key
+// Runtime corner radius (px). Default WIN_RADIUS; the nyx.conf `rounding` key overrides it
+// (0 = fully square windows + start menu). win_radius() still shrinks it per window so a
+// minimum-size window never over-rounds. Set by apply_nyx_config().
+static int g_corner_radius = WIN_RADIUS;
 
 // Rounded-corner primitives (fb_corner_inset / fb_fill_round_rect /
 // fb_stroke_round_rect) and the integer sqrt now live in fb.c, shared with the
@@ -258,7 +267,7 @@ static void draw_max_button(int x, int y, int size, uint32_t color) {
 // The radius a given window can actually use: shrink it so a minimum-size window
 // (120x80) never rounds so hard the two corners meet.
 static int win_radius(window_t* win) {
-    int r = WIN_RADIUS;
+    int r = g_corner_radius;
     if (r > (int)win->w / 2) r = (int)win->w / 2;
     if (r > TITLE_H)         r = TITLE_H;             // rounding lives in the title bar
     return r < 0 ? 0 : r;
@@ -287,6 +296,37 @@ static uint32_t col_lighten(uint32_t c, int pct) {
 static uint32_t col_darken(uint32_t c, int pct) {
     int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
     return fb_rgb(r - r * pct / 100, g - g * pct / 100, b - b * pct / 100);
+}
+// Alpha-mix two colours per channel: `a` percent of `fg` over `bg` (0 = all bg, 100 = all
+// fg). The reusable blend primitive — used now by the `panel_tint` frosted taskbar, and the
+// groundwork for future true (fb-read-back) window/panel translucency.
+static uint32_t col_blend(uint32_t fg, uint32_t bg, int a) {
+    if (a < 0) a = 0; else if (a > 100) a = 100;
+    int fr = (fg >> 16) & 0xFF, fgn = (fg >> 8) & 0xFF, fbn = fg & 0xFF;
+    int br = (bg >> 16) & 0xFF, bgn = (bg >> 8) & 0xFF, bbn = bg & 0xFF;
+    return fb_rgb((fr * a + br * (100 - a)) / 100,
+                  (fgn * a + bgn * (100 - a)) / 100,
+                  (fbn * a + bbn * (100 - a)) / 100);
+}
+
+// KAT for col_blend: endpoints (all-fg / all-bg), a half mix, a quarter mix, and the
+// identity of blending equal colours. 0 = pass.
+int col_blend_selftest(void) {
+    uint32_t red = fb_rgb(255, 0, 0), blue = fb_rgb(0, 0, 255);
+    if (col_blend(red, blue, 100) != red)  return 1;
+    if (col_blend(red, blue, 0)   != blue) return 2;
+    if (col_blend(red, blue, 50)  != fb_rgb(127, 0, 127)) return 3;
+    if (col_blend(fb_rgb(255,255,255), fb_rgb(0,0,0), 25) != fb_rgb(63, 63, 63)) return 4;
+    if (col_blend(fb_rgb(128,128,128), fb_rgb(128,128,128), 40) != fb_rgb(128,128,128)) return 5;
+    return 0;
+}
+
+// The taskbar background, tinted toward the wallpaper's colour by nyx.conf `panel_tint`
+// (0 = the plain theme colour, the default; 100 = fully the wallpaper colour) — a frosted
+// panel that picks up the desktop hue. Two known colours, so no fb read-back and no
+// per-frame drift. Every taskbar_bg draw site routes through here to stay coherent.
+static uint32_t taskbar_bg_effective(void) {
+    return g_panel_tint ? col_blend(wallpaper_base_color(), taskbar_bg, g_panel_tint) : taskbar_bg;
 }
 
 // The runtime UI accent (declared in theme.h; THEME_ACCENT/THEME_ACCENT_DIM read
@@ -341,6 +381,7 @@ static void fit_title(const char* title, int avail_px, char* out, int outsz) {
     out[i] = '\0';
 }
 
+static int title_text_x(int left, int right, int textw, int center);   // fwd (defined with its KAT below)
 static void draw_titlebar(window_t* win) {
     uint32_t base = win->focused ? title_active : title_inactive;
     // A subtle top-lit vertical gradient gives the bar some dimension to sit with
@@ -375,7 +416,8 @@ static void draw_titlebar(window_t* win) {
     fit_title(win->title, leftmost_btn - 6 - text_x, tbuf, (int)sizeof(tbuf));
 
     int y_off = win->y + (TITLE_H - FONT_HEIGHT) / 2;
-    font_draw_string_trans(text_x, y_off, tbuf, THEME_TITLE_TEXT);
+    int tx = title_text_x(text_x, leftmost_btn - 6, (int)strlen(tbuf) * FONT_WIDTH, g_title_center);
+    font_draw_string_trans(tx, y_off, tbuf, THEME_TITLE_TEXT);
 
     int bx = win->x + win->w - CLOSE_W - 2;
     if (win->has_close) {
@@ -397,8 +439,12 @@ static void draw_window_frame(window_t* win) {
     // continuous edge. Previously this bevel was identical on every window, so a
     // window buried under others gave no focus cue at all once its title bar was
     // covered.
-    uint32_t hi = win->focused ? THEME_ACCENT     : THEME_FRAME_HI;
-    uint32_t lo = win->focused ? THEME_ACCENT_DIM : THEME_FRAME_LO;
+    // Focused windows outline in the accent (or the nyx.conf `border` color if set), so
+    // the border + title strip read as one edge; unfocused windows keep the neutral bevel.
+    uint32_t acc_hi = g_border_color ? g_border_color               : THEME_ACCENT;
+    uint32_t acc_lo = g_border_color ? col_darken(g_border_color, 28) : THEME_ACCENT_DIM;
+    uint32_t hi = win->focused ? acc_hi : THEME_FRAME_HI;
+    uint32_t lo = win->focused ? acc_lo : THEME_FRAME_LO;
     int x = win->x, y = win->y, w = (int)win->w, H = (int)win_total_h(win);
     int R = win_radius(win);
 
@@ -729,7 +775,7 @@ static int systray_online(void) {
 #define TASKBAR_MOD_W 148   // live CPU%/RAM% status module, just left of the tray
 static void draw_systray(int x, int tb_y) {
     int cy = tb_y + TASKBAR_H / 2;
-    fb_fill_rect(x, tb_y + 4, SYSTRAY_W, TASKBAR_H - 8, col_darken(taskbar_bg, 14));  // inset panel
+    fb_fill_rect(x, tb_y + 4, SYSTRAY_W, TASKBAR_H - 8, col_darken(taskbar_bg_effective(), 14));  // inset panel
 
     // network: four ascending signal bars
     int online = systray_online();
@@ -794,8 +840,8 @@ static void draw_taskbar(void) {
 
     // Subtle top-lit gradient bar with a 1px highlight along its top edge, to sit
     // with the windows' gradient title bars rather than reading as a flat slab.
-    fb_fill_vgrad(0, tb_y, fw, TASKBAR_H, col_lighten(taskbar_bg, 12), col_darken(taskbar_bg, 10));
-    fb_fill_rect(0, tb_y, fw, 1, col_lighten(taskbar_bg, 34));
+    fb_fill_vgrad(0, tb_y, fw, TASKBAR_H, col_lighten(taskbar_bg_effective(), 12), col_darken(taskbar_bg_effective(), 10));
+    fb_fill_rect(0, tb_y, fw, 1, col_lighten(taskbar_bg_effective(), 34));
 
     // The Menu button is the brand launcher, so it always wears the accent (dimmed
     // when the menu is closed, full-strength when open) instead of blending in.
@@ -827,7 +873,7 @@ static void draw_taskbar(void) {
         else if (windows[i]->focused)
             fb_fill_vgrad(bx, tb_y + 4, bw, bh, col_lighten(taskbar_hl, 16), col_darken(taskbar_hl, 16));
         else
-            fb_fill_vgrad(bx, tb_y + 4, bw, bh, col_lighten(taskbar_bg, 10), col_darken(taskbar_bg, 10));
+            fb_fill_vgrad(bx, tb_y + 4, bw, bh, col_lighten(taskbar_bg_effective(), 10), col_darken(taskbar_bg_effective(), 10));
         if (windows[i]->title[0])
             font_draw_string_trans(bx + 4, tb_y + (TASKBAR_H - FONT_HEIGHT) / 2,
                                    windows[i]->title, fb_rgb(230, 230, 235));
@@ -1067,7 +1113,7 @@ static void draw_start_menu(void) {
     uint32_t fh = fb_get_height();
     int sm_x = 2, sm_y = fh - TASKBAR_H - START_H;
 
-    int R = WIN_RADIUS;
+    int R = g_corner_radius;   // follow the nyx.conf `rounding` knob (0 = square menu top)
 
     // Rounded-top body. The bottom sits flush on the taskbar, so it stays square
     // there — the menu reads as growing out of the bar. Corner-outside pixels are
@@ -1861,6 +1907,7 @@ static void settings_draw_fn(window_t* win, int cx, int cy, uint32_t cw, uint32_
 // gradient, no compounding) and the cost is perimeter, not area — a handful of
 // thin strips per window instead of RADIUS full-window fills.
 static void draw_window_shadow(window_t* win) {
+    if (!g_shadows) return;                      // nyx.conf `shadow = off` -> flat, shadowless windows
     // A maximized window fills the usable area, so its shadow would be entirely
     // behind it or off-screen: pure wasted work. Snapped/normal windows all cast.
     if (win->state == WSTATE_MAXIMIZED) return;
@@ -1892,7 +1939,7 @@ static void draw_window_shadow(window_t* win) {
 // (already drawn), reading as growing out of it, so a shadow there would just
 // smudge the bar — the side bands stop at the taskbar top for the same reason.
 static void draw_start_menu_shadow(void) {
-    if (!start_menu_open) return;
+    if (!start_menu_open || !g_shadows) return;   // nyx.conf `shadow = off` -> no menu shadow either
     int fh = (int)fb_get_height();
     int sm_x = 2, sm_y = fh - TASKBAR_H - START_H;
     int bar_top = fh - TASKBAR_H;                 // side bands stop here, off the taskbar
@@ -1964,6 +2011,46 @@ void compositor_redraw_now(void) {
     redraw_all();
     fb_present();     // this path runs outside the event loop, so publish here
     frame_dirty = 0;
+}
+
+// Dirty-rect groundwork (FLUIDEZ): is any window ABOVE `a` (higher z, so it draws
+// on top in redraw_all's sorted pass) overlapping a's footprint — INCLUDING the
+// drop-shadow margin, since a higher window's shadow can fall onto a? If so, a
+// clipped repaint of `a` alone would paint over that window, so the caller must
+// fall back to a full redraw_all. Only visible, non-minimized windows on the
+// current workspace count.
+static int window_occluded_above(window_t* a) {
+    const int M = SHADOW_OFFSET + SHADOW_RADIUS + 2;
+    int ax0 = a->x - M, ay0 = a->y - M;
+    int ax1 = a->x + (int)a->w + M, ay1 = a->y + (int)win_total_h(a) + M;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t* b = windows[i];
+        if (!b || b == a || !b->visible || b->state == WSTATE_MINIMIZED
+            || b->workspace != current_workspace || b->z_order <= a->z_order) continue;
+        int bx0 = b->x - M, by0 = b->y - M;
+        int bx1 = b->x + (int)b->w + M, by1 = b->y + (int)win_total_h(b) + M;
+        if (ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1) return 1;   // overlap
+    }
+    return 0;
+}
+
+// Dirty-rect FIRST SLICE (FLUIDEZ): repaint just ONE window into the persistent
+// back buffer, WITHOUT touching the wallpaper, its (unmoved) drop shadow, the other
+// windows, or the taskbar — they stay valid from the last full redraw_all. This is
+// exactly redraw_all's per-window block for `win`, minus draw_window_shadow (the
+// window isn't moving, so its shadow pixels are already correct). The caller must
+// guarantee nothing else changed this frame and `win` is un-occluded (see
+// window_occluded_above) so the result is pixel-identical to a full recomposite.
+static void redraw_window_only(window_t* win) {
+    int wr = win_radius(win);
+    fb_set_round_clip(win->x, win->y, (int)win->w, (int)win_total_h(win), wr);
+    fb_fill_rect(win->x, win->y + TITLE_H, win->w, win->h, fb_rgb(35,35,40));
+    if (win->draw)
+        win->draw(win, win->x, win->y + TITLE_H, win->w, win->h);
+    fb_clear_clip();
+    draw_window_frame(win);
+    draw_titlebar(win);
+    frame_dirty = 1;      // a fresh (partial) frame is in the back buffer, awaiting present
 }
 
 // ---------------------------------------------------------------------------
@@ -2749,6 +2836,17 @@ void display_set_mode(uint32_t w, uint32_t h) {
            fb_get_width(), fb_get_height(), window_count);
 }
 
+// Copy `title` into win->title with truncation to MAX_TITLE-1 and NUL-termination.
+// ONE definition shared by window_create and window_set_title so the two can never
+// drift on the truncation rule. No redraw — callers that want it on screen do that.
+static void window_store_title(window_t* win, const char* title) {
+    if (!title) title = "";
+    int sl = strlen(title);
+    if (sl >= MAX_TITLE) sl = MAX_TITLE - 1;
+    memcpy(win->title, title, sl);
+    win->title[sl] = '\0';
+}
+
 window_t* window_create(int x, int y, uint32_t w, uint32_t h, const char* title, window_draw_fn draw) {
     if (window_count >= MAX_WINDOWS) return NULL;
     int slot = -1;
@@ -2807,14 +2905,46 @@ window_t* window_create(int x, int y, uint32_t w, uint32_t h, const char* title,
     win->on_click = NULL;
     win->on_mousemove = NULL;
     win->reserved = NULL;
-    int sl = strlen(title);
-    if (sl >= MAX_TITLE) sl = MAX_TITLE - 1;
-    memcpy(win->title, title, sl);
-    win->title[sl] = '\0';
+    window_store_title(win, title);
     windows[slot] = win;
     window_count++;
     window_focus(win->id);
     return win;
+}
+
+// Change a window's title-bar text after creation. find_window rejects an unknown id
+// (returns -1) BEFORE any redraw, so the KAT can exercise that path headless; the
+// success path copies via the shared helper and recomposites so the title bar AND the
+// taskbar button (both read win->title) pick up the new text.
+int window_set_title(int id, const char* title) {
+    window_t* win = find_window(id);
+    if (!win) return -1;
+    window_store_title(win, title);
+    redraw_all();
+    return 0;
+}
+
+// KAT: window_set_title's copy logic (via the shared window_store_title) truncates and
+// NUL-terminates like window_create, and the id lookup rejects an unknown window. The
+// copy is checked on a throwaway window_t (no redraw); the reject path returns before any
+// recomposite, so the whole test runs headless in the idle compositor.
+int title_set_selftest(void) {
+    static window_t fake;
+    memset_asm(&fake, 0, sizeof fake);
+    int rc = 0;
+    window_store_title(&fake, "hello");
+    if (strcmp(fake.title, "hello") != 0) rc = 1;
+    else { window_store_title(&fake, 0); if (fake.title[0] != '\0') rc = 2; }   // NULL -> ""
+    if (!rc) {                                                                  // over-long truncates
+        static char longt[MAX_TITLE + 16];
+        for (int i = 0; i < MAX_TITLE + 15; i++) longt[i] = 'A';
+        longt[MAX_TITLE + 15] = '\0';
+        window_store_title(&fake, longt);
+        if ((int)strlen(fake.title) != MAX_TITLE - 1) rc = 3;
+        else if (fake.title[MAX_TITLE - 1] != '\0')   rc = 4;
+    }
+    if (!rc && window_set_title(-31337, "x") != -1) rc = 5;                     // unknown id -> -1
+    return rc;
 }
 
 static void focus_next_window(void) {
@@ -3675,6 +3805,131 @@ static void draw_desktop_icons(void) {
     if (drag_icon_idx >= 0) draw_icon_at(drag_icon_idx);
 }
 
+// nyx.conf `border` — the focused window's outline color. Default (or "accent") follows
+// the UI accent, as the frame always has; a palette color name (Morado/Azul/Turquesa/…)
+// outlines focused windows in a distinct color — the canonical rice "focused border color".
+// Returns the rgb, or 0 meaning "follow the accent" (an unknown name falls back to that).
+static uint32_t border_resolve(const char* name) {
+    if (!name || strcmp(name, "accent") == 0) return 0;
+    int idx = wallpaper_color_from_name(name);
+    return idx >= 0 ? wallpaper_color_rgb(idx) : 0;
+}
+
+// KAT: the border-color resolver — "accent"/unknown/NULL -> 0 (follow accent), a real
+// palette name -> that exact rgb. 0 = pass.
+int border_color_selftest(void) {
+    if (border_resolve("accent") != 0) return 1;
+    if (border_resolve(0) != 0) return 2;
+    if (border_resolve("zzz") != 0) return 3;
+    if (border_resolve("Morado")   != fb_rgb(130, 90, 210)) return 4;
+    if (border_resolve("Turquesa") != fb_rgb(40, 160, 175)) return 5;
+    if (border_resolve("Carbon")   != fb_rgb(45, 50, 70))   return 6;
+    return 0;
+}
+
+// nyx.conf `rounding` — the window/menu corner radius in px, clamped to [0, WIN_RADIUS_MAX].
+// 0 = fully square windows (a classic rice choice); a leading non-digit or NULL -> 0. Pure
+// (does not set g_corner_radius) so the KAT can check the parse in isolation.
+static int rounding_resolve(const char* val) {
+    int r = 0;
+    if (val) for (const char* p = val; *p >= '0' && *p <= '9'; p++) r = r * 10 + (*p - '0');
+    if (r > WIN_RADIUS_MAX) r = WIN_RADIUS_MAX;
+    return r < 0 ? 0 : r;
+}
+
+// KAT: the `rounding` parser clamps to [0, WIN_RADIUS_MAX] and maps NULL / non-numeric to 0.
+int rounding_selftest(void) {
+    if (rounding_resolve("7")   != 7)              return 1;
+    if (rounding_resolve("0")   != 0)              return 2;   // square windows
+    if (rounding_resolve("999") != WIN_RADIUS_MAX) return 3;   // clamped
+    if (rounding_resolve(0)     != 0)              return 4;   // NULL -> 0
+    if (rounding_resolve("abc") != 0)              return 5;   // non-numeric -> 0
+    if (rounding_resolve("12")  != 12)             return 6;
+    return 0;
+}
+
+// nyx.conf boolean-OFF parse: any of off/0/false/no reads as "disabled"; anything else
+// (including NULL) is "enabled". Shared by toggle keys like `shadow`.
+static int conf_is_off(const char* val) {
+    return val && (strcmp(val, "off")   == 0 || strcmp(val, "0")  == 0 ||
+                   strcmp(val, "false") == 0 || strcmp(val, "no") == 0);
+}
+
+// x for the title text in the span [left, right): left-aligned, or centered when `center` and the
+// (already-fit) text is narrower than the span. Never left of `left`, never past the buttons.
+static int title_text_x(int left, int right, int textw, int center) {
+    if (!center) return left;
+    int span = right - left;
+    if (textw >= span || span <= 0) return left;
+    return left + (span - textw) / 2;
+}
+
+// KAT: the title-text x placement — left mode is width-independent; centered splits the slack,
+// clamps to `left` when the text is as wide as / wider than the span, and on a degenerate span.
+int titlebar_selftest(void) {
+    if (title_text_x(10, 200, 40, 0)  != 10)  return 1;   // left mode -> always `left`
+    if (title_text_x(10, 200, 40, 1)  != 85)  return 2;   // centered: 10 + (190-40)/2
+    if (title_text_x(10, 200, 300, 1) != 10)  return 3;   // wider than span -> clamp left
+    if (title_text_x(10, 200, 190, 1) != 10)  return 4;   // exact fit -> left
+    if (title_text_x(100, 100, 0, 1)  != 100) return 5;   // degenerate span -> left
+    return 0;
+}
+
+// KAT: conf_is_off recognises exactly off/0/false/no as disabled; everything else (incl. NULL,
+// and case variants like "Off") is enabled.
+int shadow_selftest(void) {
+    if (!conf_is_off("off"))   return 1;
+    if (!conf_is_off("0"))     return 2;
+    if (!conf_is_off("false")) return 3;
+    if (!conf_is_off("no"))    return 4;
+    if (conf_is_off("on"))     return 5;
+    if (conf_is_off("1"))      return 6;
+    if (conf_is_off("yes"))    return 7;
+    if (conf_is_off(0))        return 8;   // NULL -> enabled
+    if (conf_is_off("Off"))    return 9;   // case-sensitive -> enabled
+    return 0;
+}
+
+// nyx.conf `scheme` — one-word colorscheme presets. Each preset names a coordinated
+// (wallpaper style, accent color) pair, so a single keyword themes the whole desktop —
+// the "swappable colorschemes" the rice north star asks for. Returns 1 and sets *wp and
+// *accent to the preset's wallpaper-style + accent-color NAMES (fed straight into the same
+// validated wallpaper_*_from_name lookups the wallpaper/accent keys use), or 0 for an
+// unknown name (the caller then keeps whatever the other keys set).
+static int scheme_lookup(const char* name, const char** wp, const char** accent) {
+    static const struct { const char* name; const char* wp; const char* accent; } S[] = {
+        { "nightfall", "Nightfall",  "Morado"   },   // signature default: moon + brand purple
+        { "aurora",    "Aurora",     "Turquesa" },
+        { "ember",     "Meteoros",   "Naranja"  },
+        { "nebula",    "Nebula",     "Rosa"     },
+        { "abyss",     "Astral",     "Azul"     },
+        { "forest",    "Cordillera", "Verde"    },
+        { "mono",      "Plano",      "Pizarra"  },
+    };
+    for (int i = 0; i < (int)(sizeof(S) / sizeof(S[0])); i++)
+        if (strcmp(name, S[i].name) == 0) { *wp = S[i].wp; *accent = S[i].accent; return 1; }
+    return 0;
+}
+
+// KAT: the colorscheme presets. Every preset must resolve to a REAL wallpaper style AND a
+// REAL accent color (a typo'd preset would silently no-op), two specific mappings are pinned,
+// and an unknown name must be rejected. 0 = pass.
+int scheme_selftest(void) {
+    const char *wp, *ac;
+    if (!scheme_lookup("nightfall", &wp, &ac)) return 1;
+    if (strcmp(wp, "Nightfall") || strcmp(ac, "Morado")) return 2;
+    if (!scheme_lookup("aurora", &wp, &ac)) return 3;
+    if (strcmp(wp, "Aurora") || strcmp(ac, "Turquesa")) return 4;
+    static const char* names[] = { "nightfall", "aurora", "ember", "nebula", "abyss", "forest", "mono" };
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
+        if (!scheme_lookup(names[i], &wp, &ac)) return 5;
+        if (wallpaper_style_from_name(wp) < 0) return 6;   // a real wallpaper style
+        if (wallpaper_color_from_name(ac) < 0) return 7;   // a real accent color
+    }
+    if (scheme_lookup("bogus", &wp, &ac)) return 8;        // unknown -> rejected
+    return 0;
+}
+
 // Rice config foundation (v6.5.23): read /etc/nyx.conf at desktop start and apply the
 // desktop settings it names. A missing file or unknown value just leaves the defaults, so
 // the desktop always comes up. Currently drives the wallpaper style + accent color; future
@@ -3700,6 +3955,15 @@ static void apply_nyx_config(void) {
             theme_set_accent(wallpaper_base_color()); // …AND the whole UI chrome, cohesively
         }
     }
+    if (nyxconf_get(buf, "scheme", val, sizeof val)) {
+        const char *swp, *sac;                      // a one-word preset overrides wallpaper+accent
+        if (scheme_lookup(val, &swp, &sac)) {
+            int s = wallpaper_style_from_name(swp);
+            int c = wallpaper_color_from_name(sac);
+            if (s >= 0) wallpaper_set_style(s);
+            if (c >= 0) { wallpaper_set_color(c); theme_set_accent(wallpaper_base_color()); }
+        }
+    }
     if (nyxconf_get(buf, "widget", val, sizeof val)) {
         // live desktop CPU/RAM widget: any of off/0/false/no disables it (default on)
         g_widget_on = !(strcmp(val, "off") == 0 || strcmp(val, "0") == 0 ||
@@ -3717,6 +3981,24 @@ static void apply_nyx_config(void) {
         for (const char* p = val; *p >= '0' && *p <= '9'; p++) gp = gp * 10 + (*p - '0');
         if (gp > 64) gp = 64;                        // clamp to a sane rice range
         g_gaps = gp;
+    }
+    if (nyxconf_get(buf, "border", val, sizeof val)) {
+        g_border_color = border_resolve(val);        // focused-window outline; 0 = follow accent
+    }
+    if (nyxconf_get(buf, "panel_tint", val, sizeof val)) {
+        int t = 0;                                   // % the taskbar tints toward the wallpaper
+        for (const char* p = val; *p >= '0' && *p <= '9'; p++) t = t * 10 + (*p - '0');
+        if (t > 100) t = 100;
+        g_panel_tint = t;
+    }
+    if (nyxconf_get(buf, "rounding", val, sizeof val)) {
+        g_corner_radius = rounding_resolve(val);      // window/menu corner radius; 0 = square
+    }
+    if (nyxconf_get(buf, "shadow", val, sizeof val)) {
+        g_shadows = !conf_is_off(val);                // window/menu drop shadows; off = flat
+    }
+    if (nyxconf_get(buf, "title_align", val, sizeof val)) {
+        g_title_center = (strcmp(val, "center") == 0);  // title-bar text: center, else left (default)
     }
 }
 
@@ -3950,6 +4232,11 @@ void compositor_run(void) {
         }
 
         if (resize_id && !(btns & 1)) {
+            // Drag-resize released: notify the window of its FINAL client size (once, not per
+            // pixel) so a ring-3 client can realloc + re-present. win->w/win->h are the client
+            // dims (title bar is separate — see the .67 TITLE_H fix).
+            window_t* rw = find_window(resize_id);
+            if (rw && rw->on_resize) rw->on_resize(rw, (int)rw->w, (int)rw->h);
             resize_id = 0; redraw = 1;
         }
 
@@ -4574,7 +4861,39 @@ done_click:
         }
 
         if (redraw) {
-            redraw_all();
+            // Dirty-rect clip-redraw (FLUIDEZ): when the SOLE dirty source this frame is the on_tick
+            // of 1..TICK_MAX_RECTS animating windows (games, video, live graphs) and nothing outside
+            // them could have changed, repaint ONLY those windows instead of the whole scene — the
+            // back buffer is persistent, so the wallpaper (~8.8M cyc), their unmoved shadows, every
+            // other window and the taskbar stay valid from the last full frame. .69 did the single
+            // window; .71 generalises to the multi-window case (a game + the Nyx Monitor, Nyx Flex
+            // tiles). Each ticked window must be un-occluded (window_occluded_above) — which also
+            // means the ticked windows can't overlap EACH OTHER (an overlap puts one above the other
+            // → that one occludes it → fall back), so paint order doesn't matter. The guard is a
+            // strict SUBSET of the tick_partial PRESENT conditions below, so the publish shrinks to
+            // match; if ANY ticked window fails the guard, one full redraw_all covers everything.
+            window_t* clipwins[TICK_MAX_RECTS];
+            int nclip = 0, clip_ok = 0;
+            if (redraw_pre_tick == 0 && tick_changed >= 1 && tick_changed <= TICK_MAX_RECTS
+                && !taskbar_only && !widget_only && !drag_id && !resize_id
+                && !fb_fullscreen_active() && !wallpaper_animated()
+                && notify_active_count(now) == 0 && !toast_just_expired
+                && !start_menu_open && !ctx_menu_open && !user_menu_open) {
+                clip_ok = 1;
+                for (int t = 0; t < tick_changed; t++) {
+                    window_t* tw = windows[tick_idx[t]];
+                    if (!tw || !tw->visible || tw->state == WSTATE_MINIMIZED
+                        || tw->workspace != current_workspace || window_occluded_above(tw)) {
+                        clip_ok = 0; break;
+                    }
+                    clipwins[nclip++] = tw;
+                }
+            }
+            if (clip_ok && nclip >= 1) {
+                for (int t = 0; t < nclip; t++) redraw_window_only(clipwins[t]);
+            } else {
+                redraw_all();
+            }
             redraw = 0;
         } else {
             if (taskbar_only) draw_taskbar();   // idle clock/module refresh: taskbar strip only

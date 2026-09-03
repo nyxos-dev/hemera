@@ -93,6 +93,7 @@ struct window {
     void (*on_click)(struct window* win, int mx, int my, int btn);
     void (*on_pressed)(struct window* win, int mx, int my, int btn);
     void (*on_mousemove)(struct window* win, int mx, int my, int btns);
+    void (*on_resize)(struct window* win, int w, int h);   // client area resized (fired on drag-release); w,h = new CLIENT size
     int  (*on_tick)(struct window* win);   // periodic ~30fps tick; returns 1 if it changed something needing a redraw (0 = idle, no repaint)
     void (*on_close)(struct window* win);  // optional: called by window_destroy BEFORE freeing `reserved`, so an app can release ctx sub-allocations
     void* reserved;
@@ -100,6 +101,10 @@ struct window {
 
 void compositor_init(void);
 window_t* window_create(int x, int y, uint32_t w, uint32_t h, const char* title, window_draw_fn draw);
+// Replace a window's title-bar text after creation (a ring-3 client via SYS_WIN_SET_TITLE,
+// or an in-kernel app). Truncated to MAX_TITLE-1; redraws so the bar + taskbar refresh.
+// Returns 0, or -1 for an unknown id.
+int window_set_title(int id, const char* title);
 // Change the screen mode and re-flow icons + open windows onto it. Callers must
 // pass a mode the hardware actually supports — vbe_set_mode validates nothing.
 void display_set_mode(uint32_t w, uint32_t h);
@@ -123,6 +128,13 @@ window_t* compositor_open_editor(const char* path);  // open Text Editor, option
 int cursor_pick_selftest(void);   // KAT: pointer shape picked from the window under it (I-beam over text)
 int cursor_resize_selftest(void); // KAT: resize-edge dir -> directional cursor mapping
 int snap_gap_selftest(void);      // KAT: snap/maximize tiling geometry, with and without WM gaps
+int scheme_selftest(void);        // KAT: nyx.conf colorscheme presets resolve to real wallpaper+accent names
+int border_color_selftest(void);  // KAT: nyx.conf `border` focused-window outline color resolves to real palette rgb
+int col_blend_selftest(void);     // KAT: the col_blend alpha-mix primitive (panel_tint / future translucency)
+int title_set_selftest(void);     // KAT: window_set_title copy/truncation + bad-id reject (SYS_WIN_SET_TITLE path)
+int rounding_selftest(void);      // KAT: nyx.conf `rounding` corner-radius parse + clamp (0 = square windows)
+int shadow_selftest(void);        // KAT: nyx.conf boolean-off parse (`shadow` toggle: off/0/false/no)
+int titlebar_selftest(void);      // KAT: title-bar text x placement (nyx.conf `title_align` left/center)
 extern int compositor_logout_requested;              // user menu "Log out" -> boot loop re-shows login
 
 #endif
