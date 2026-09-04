@@ -59,6 +59,7 @@ static uint32_t g_border_color = 0; // focused-window outline override — nyx.c
 static int g_panel_tint = 0;        // taskbar tint toward the wallpaper colour, 0-100% — nyx.conf `panel_tint` (0 = off)
 static int g_shadows   = 1;         // window + start-menu drop shadows — nyx.conf `shadow` (off = flat, no shadows)
 static int g_title_center = 0;      // title-bar text alignment — nyx.conf `title_align` (0 = left default, 1 = center)
+static int g_wallpaper_dim = 0;     // wallpaper darken percent 0..80 — nyx.conf `wallpaper_dim` (0 = off; mutes the background so windows/icons pop)
 static int net_popup_open = 0;      // the system tray's network-status popup
 static int spk_popup_open = 0;      // the system tray's sound/volume popup
 static int g_volume = 75;           // master volume 0..100 (persisted while running)
@@ -1954,6 +1955,11 @@ static void draw_start_menu_shadow(void) {
 
 static void redraw_all(void) {
     draw_background();
+    // nyx.conf `wallpaper_dim`: mute the freshly-painted wallpaper by g_wallpaper_dim percent
+    // (BEFORE widgets/icons/windows, so only the background dims). Off (0) = a no-op.
+    if (g_wallpaper_dim > 0)
+        fb_darken_rect(0, 0, (int)fb_get_width(), (int)fb_get_height(),
+                       (uint8_t)(g_wallpaper_dim * 255 / 100));
     draw_desktop_widget();   // on the wallpaper, behind windows
     draw_desktop_icons();
 
@@ -3704,17 +3710,20 @@ static void draw_icon_at(int i) {
 // lighter shade, so the widget follows the runtime colorscheme (v6.5.28). Toggle with
 // `widget = on|off` in nyx.conf.
 #define WGT_W        180
-#define WGT_H        124          // two stacked graphs (CPU + RAM)
+#define WGT_H        182          // three stacked graphs (CPU + RAM + NET)
 #define WGT_MARGIN    16
 #define WGT_N        160          // history samples == graph width in px
 #define WGT_SAMPLE_MS 500u        // sample + scroll cadence
+#define WGT_NET_REF  131072u      // bytes/s that fills the NET bar (128 KB/s); higher clamps to 100%
 // Animation partial-present: publish up to this many simultaneously-animating windows' rects
 // (a game + the live monitor + a GIF, or the Nyx Flex tiles) instead of a full-screen blit.
 // Beyond it — or when the combined damage covers most of the screen — a full present is cheaper.
 #define TICK_MAX_RECTS 4
 int g_widget_on = 1;              // set from /etc/nyx.conf (apply_nyx_config); default on
 int g_widget_pos = 0;             // 0=bottom-right (default) 1=bottom-left 2=top-right 3=top-left — nyx.conf `widget_pos`
-static uint8_t wgt_cpu[WGT_N], wgt_ram[WGT_N];
+static uint8_t wgt_cpu[WGT_N], wgt_ram[WGT_N], wgt_net[WGT_N];
+static uint64_t wgt_net_last;         // net_total_bytes() at the previous sample
+static unsigned long wgt_net_bps;     // current NET rate (bytes/s) for the caption
 
 // nyx.conf name <-> index for the widget corner (rice: place the monitor where you like).
 static const char* widget_pos_name(int p) {
@@ -3743,13 +3752,44 @@ static uint32_t wgt_ram_pct(void) {
     return mt ? (uint32_t)(((uint64_t)mu * 100) / mt) : 0;
 }
 
-// Push the current CPU% + RAM% and scroll both histories one sample left (newest at right).
+// Format a bytes/second rate as a short human string ("0 B/s", "12 KB/s", "3 MB/s") for the
+// NET graph caption — integer units, no decimals. Pure; KAT'd by net_rate_selftest.
+static void net_rate_str(unsigned long bps, char* out, int outsz) {
+    if (bps < 1024UL)                snprintf(out, outsz, "%lu B/s", bps);
+    else if (bps < 1024UL * 1024UL)  snprintf(out, outsz, "%lu KB/s", bps / 1024UL);
+    else                             snprintf(out, outsz, "%lu MB/s", bps / (1024UL * 1024UL));
+}
+
+// KAT: the NET-rate caption formatter — B/s under 1 KiB, KB/s under 1 MiB (truncating), else
+// MB/s. 0 = pass.
+int net_rate_selftest(void) {
+    char b[24];
+    net_rate_str(0, b, sizeof b);        if (strcmp(b, "0 B/s")     != 0) return 1;
+    net_rate_str(512, b, sizeof b);      if (strcmp(b, "512 B/s")   != 0) return 2;
+    net_rate_str(1023, b, sizeof b);     if (strcmp(b, "1023 B/s")  != 0) return 3;
+    net_rate_str(1024, b, sizeof b);     if (strcmp(b, "1 KB/s")    != 0) return 4;
+    net_rate_str(1536, b, sizeof b);     if (strcmp(b, "1 KB/s")    != 0) return 5;   // truncates
+    net_rate_str(1048575, b, sizeof b);  if (strcmp(b, "1023 KB/s") != 0) return 6;
+    net_rate_str(1048576, b, sizeof b);  if (strcmp(b, "1 MB/s")    != 0) return 7;
+    net_rate_str(5242880, b, sizeof b);  if (strcmp(b, "5 MB/s")    != 0) return 8;
+    return 0;
+}
+
+// Push the current CPU%, RAM% and NET rate and scroll all three histories one sample left.
 static void wgt_push_sample(void) {
     uint32_t c = perf_cpu_percent(); if (c > 100) c = 100;
     uint32_t r = wgt_ram_pct();      if (r > 100) r = 100;
-    for (int i = 1; i < WGT_N; i++) { wgt_cpu[i - 1] = wgt_cpu[i]; wgt_ram[i - 1] = wgt_ram[i]; }
+    // NET: bytes since the last sample -> a per-second rate over the WGT_SAMPLE_MS window,
+    // normalized against WGT_NET_REF for the 0..100 bar height. Counters only ever climb.
+    uint64_t tot = net_total_bytes();
+    uint64_t delta = (tot >= wgt_net_last) ? (tot - wgt_net_last) : 0;
+    wgt_net_last = tot;
+    wgt_net_bps = (unsigned long)(delta * 1000u / WGT_SAMPLE_MS);
+    uint32_t np = (uint32_t)(wgt_net_bps * 100u / WGT_NET_REF); if (np > 100) np = 100;
+    for (int i = 1; i < WGT_N; i++) { wgt_cpu[i-1] = wgt_cpu[i]; wgt_ram[i-1] = wgt_ram[i]; wgt_net[i-1] = wgt_net[i]; }
     wgt_cpu[WGT_N - 1] = (uint8_t)c;
     wgt_ram[WGT_N - 1] = (uint8_t)r;
+    wgt_net[WGT_N - 1] = (uint8_t)np;
 }
 
 // Does any visible window overlap the widget's rect? (If so, skip its partial repaint — it
@@ -3767,9 +3807,8 @@ static int widget_covered(void) {
 
 // Draw one labelled history graph: a dark inset, a 50% grid line, and WGT_N bars rising from
 // the baseline in `color`, with a "LABEL nn%" caption above it.
-static void wgt_draw_graph(int x, int y, const char* label, uint32_t pct, const uint8_t* series, uint32_t color) {
-    char cap[24]; snprintf(cap, sizeof cap, "%s %u%%", label, pct);
-    font_draw_string_trans(x, y, cap, fb_rgb(212, 206, 228));
+static void wgt_draw_graph(int x, int y, const char* caption, const uint8_t* series, uint32_t color) {
+    font_draw_string_trans(x, y, caption, fb_rgb(212, 206, 228));
     int gx = x, gy = y + 14, gw = WGT_N, gh = 38;
     fb_fill_rect(gx, gy, gw, gh, fb_rgb(14, 14, 18));
     fb_fill_rect(gx, gy + gh / 2, gw, 1, fb_rgb(42, 42, 52));   // 50% grid line
@@ -3792,8 +3831,14 @@ static void draw_desktop_widget(void) {
     uint32_t cpu = perf_cpu_percent(); if (cpu > 100) cpu = 100;
     // Two stacked live graphs: CPU in the accent, RAM in a lighter shade of it (both follow
     // the runtime colorscheme). Each scrolls every WGT_SAMPLE_MS → the motion the rice wants.
-    wgt_draw_graph(x + 10, y + 6,  "CPU", cpu,           wgt_cpu, THEME_ACCENT);
-    wgt_draw_graph(x + 10, y + 64, "RAM", wgt_ram_pct(), wgt_ram, col_lighten(THEME_ACCENT, 35));
+    char cap[24];
+    snprintf(cap, sizeof cap, "CPU %u%%", cpu);
+    wgt_draw_graph(x + 10, y + 6,   cap, wgt_cpu, THEME_ACCENT);
+    snprintf(cap, sizeof cap, "RAM %u%%", wgt_ram_pct());
+    wgt_draw_graph(x + 10, y + 64,  cap, wgt_ram, col_lighten(THEME_ACCENT, 35));
+    char nr[16]; net_rate_str(wgt_net_bps, nr, sizeof nr);
+    snprintf(cap, sizeof cap, "NET %s", nr);
+    wgt_draw_graph(x + 10, y + 122, cap, wgt_net, col_lighten(THEME_ACCENT, 60));
 }
 
 static void draw_desktop_icons(void) {
@@ -3827,6 +3872,74 @@ int border_color_selftest(void) {
     return 0;
 }
 
+// nyx.conf `accent` may name a preset OR give a raw #RRGGBB hex, so a rice can pick ANY accent
+// color, not just the 11 presets. Parse exactly six hex digits with an optional leading '#'
+// (values arrive space/CR-trimmed from nyxconf_get); on success store the rgb and return 1,
+// else return 0 (the caller then tries the preset-name path). Pure.
+static int parse_hex_color(const char* s, uint32_t* out) {
+    if (!s) return 0;
+    if (*s == '#') s++;
+    int v[6];
+    for (int i = 0; i < 6; i++) {
+        char c = s[i];
+        if      (c >= '0' && c <= '9') v[i] = c - '0';
+        else if (c >= 'a' && c <= 'f') v[i] = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v[i] = c - 'A' + 10;
+        else return 0;                          // too short or a non-hex digit
+    }
+    if (s[6] != '\0') return 0;                 // trailing garbage / too long
+    if (out) *out = fb_rgb((uint32_t)(v[0]*16 + v[1]),
+                           (uint32_t)(v[2]*16 + v[3]),
+                           (uint32_t)(v[4]*16 + v[5]));
+    return 1;
+}
+
+// KAT: the #RRGGBB accent parser — accepts 6 hex digits with/without '#' (case-insensitive),
+// rejects wrong length / non-hex / trailing garbage, and never touches *out on failure. 0 = pass.
+int hex_color_selftest(void) {
+    uint32_t c = 0;
+    if (!parse_hex_color("#1E90FF", &c) || c != fb_rgb(0x1E, 0x90, 0xFF)) return 1;
+    if (!parse_hex_color("1e90ff",  &c) || c != fb_rgb(0x1E, 0x90, 0xFF)) return 2;  // no '#', lowercase
+    if (!parse_hex_color("#000000", &c) || c != fb_rgb(0, 0, 0))          return 3;
+    if (!parse_hex_color("#FFFFFF", &c) || c != fb_rgb(255, 255, 255))    return 4;
+    if (parse_hex_color("#12345",  &c))  return 5;   // too short
+    if (parse_hex_color("#1234567", &c)) return 6;   // too long
+    if (parse_hex_color("#12345g",  &c)) return 7;   // non-hex digit
+    if (parse_hex_color("Morado",   &c)) return 8;   // a preset name is not hex
+    if (parse_hex_color(0,          &c)) return 9;   // NULL
+    c = 0xABCD;                                      // failure must leave *out untouched
+    if (parse_hex_color("nope!!", &c) || c != 0xABCD) return 10;
+    return 0;
+}
+
+// Format the `accent` value save_nyx_config writes back to /etc/nyx.conf: a hand-set (or
+// override) color has no palette name, so persist it as a lowercase #RRGGBB that parse_hex_color
+// reads back verbatim — otherwise saving from the GUI clobbered a #hex accent with the stale
+// index's name ("Morado"). A named color is written by name. Pure. `rgb` is an fb_rgb() value.
+static void accent_config_str(int is_override, uint32_t rgb, const char* name, char* out, int outsz) {
+    if (is_override)
+        snprintf(out, outsz, "#%02x%02x%02x", (unsigned)((rgb >> 16) & 0xFF),
+                 (unsigned)((rgb >> 8) & 0xFF), (unsigned)(rgb & 0xFF));
+    else
+        snprintf(out, outsz, "%s", name ? name : "Morado");
+}
+
+// KAT: the accent config-string round-trips through parse_hex_color (a #hex written by save must
+// re-parse to the SAME rgb), and a named color is written by name. 0 = pass.
+int accent_config_selftest(void) {
+    char b[16]; uint32_t rgb;
+    accent_config_str(1, fb_rgb(0x1E, 0x90, 0xFF), "Morado", b, sizeof b);
+    if (strcmp(b, "#1e90ff") != 0) return 1;
+    if (!parse_hex_color(b, &rgb) || rgb != fb_rgb(0x1E, 0x90, 0xFF)) return 2;   // round-trips
+    accent_config_str(0, 0, "Turquesa", b, sizeof b);
+    if (strcmp(b, "Turquesa") != 0) return 3;                                     // named -> name
+    accent_config_str(1, fb_rgb(0, 0, 0), "x", b, sizeof b);
+    if (strcmp(b, "#000000") != 0) return 4;
+    accent_config_str(1, fb_rgb(255, 255, 255), "x", b, sizeof b);
+    if (strcmp(b, "#ffffff") != 0) return 5;
+    return 0;
+}
+
 // nyx.conf `rounding` — the window/menu corner radius in px, clamped to [0, WIN_RADIUS_MAX].
 // 0 = fully square windows (a classic rice choice); a leading non-digit or NULL -> 0. Pure
 // (does not set g_corner_radius) so the KAT can check the parse in isolation.
@@ -3845,6 +3958,29 @@ int rounding_selftest(void) {
     if (rounding_resolve(0)     != 0)              return 4;   // NULL -> 0
     if (rounding_resolve("abc") != 0)              return 5;   // non-numeric -> 0
     if (rounding_resolve("12")  != 12)             return 6;
+    return 0;
+}
+
+// nyx.conf `wallpaper_dim` — darken the wallpaper by this PERCENT (0..80). 0 = off (no dim);
+// higher values mute the background so windows/icons/text stand out (an r/unixporn staple).
+// Clamped to 80 so the desktop never goes fully black; NULL / non-numeric -> 0. Pure (does not
+// set g_wallpaper_dim) so the KAT can check the parse in isolation.
+#define WALLPAPER_DIM_MAX 80
+static int wallpaper_dim_resolve(const char* val) {
+    int d = 0;
+    if (val) for (const char* p = val; *p >= '0' && *p <= '9'; p++) d = d * 10 + (*p - '0');
+    if (d > WALLPAPER_DIM_MAX) d = WALLPAPER_DIM_MAX;
+    return d < 0 ? 0 : d;
+}
+
+// KAT: the `wallpaper_dim` parser clamps to [0, WALLPAPER_DIM_MAX] and maps NULL / non-numeric to 0.
+int wallpaper_dim_selftest(void) {
+    if (wallpaper_dim_resolve("0")   != 0)                 return 1;   // off
+    if (wallpaper_dim_resolve("40")  != 40)                return 2;
+    if (wallpaper_dim_resolve("80")  != WALLPAPER_DIM_MAX) return 3;
+    if (wallpaper_dim_resolve("100") != WALLPAPER_DIM_MAX) return 4;   // clamped
+    if (wallpaper_dim_resolve(0)     != 0)                 return 5;   // NULL -> 0
+    if (wallpaper_dim_resolve("abc") != 0)                 return 6;   // non-numeric -> 0
     return 0;
 }
 
@@ -3949,10 +4085,16 @@ static void apply_nyx_config(void) {
         if (s >= 0) wallpaper_set_style(s);
     }
     if (nyxconf_get(buf, "accent", val, sizeof val)) {
-        int c = wallpaper_color_from_name(val);
-        if (c >= 0) {
-            wallpaper_set_color(c);                 // the wallpaper base color…
-            theme_set_accent(wallpaper_base_color()); // …AND the whole UI chrome, cohesively
+        uint32_t hex;
+        if (parse_hex_color(val, &hex)) {               // accent = #RRGGBB -> ANY color (wallpaper + chrome)
+            wallpaper_set_color_rgb(hex);
+            theme_set_accent(hex);
+        } else {
+            int c = wallpaper_color_from_name(val);
+            if (c >= 0) {
+                wallpaper_set_color(c);                 // the wallpaper base color…
+                theme_set_accent(wallpaper_base_color()); // …AND the whole UI chrome, cohesively
+            }
         }
     }
     if (nyxconf_get(buf, "scheme", val, sizeof val)) {
@@ -3975,6 +4117,11 @@ static void apply_nyx_config(void) {
     }
     if (nyxconf_get(buf, "clock", val, sizeof val)) {
         g_clock_12h = (strcmp(val, "12h") == 0 || strcmp(val, "12") == 0);   // else 24-hour
+    }
+    if (nyxconf_get(buf, "icons", val, sizeof val)) {
+        // desktop app icons (Files/Terminal/…/Selene): opt-IN (default off = clean desktop)
+        g_desktop_icons_visible = (strcmp(val, "on") == 0 || strcmp(val, "1") == 0 ||
+                                   strcmp(val, "true") == 0 || strcmp(val, "yes") == 0);
     }
     if (nyxconf_get(buf, "gaps", val, sizeof val)) {
         int gp = 0;                                  // px between tiles + around the screen
@@ -4000,6 +4147,9 @@ static void apply_nyx_config(void) {
     if (nyxconf_get(buf, "title_align", val, sizeof val)) {
         g_title_center = (strcmp(val, "center") == 0);  // title-bar text: center, else left (default)
     }
+    if (nyxconf_get(buf, "wallpaper_dim", val, sizeof val)) {
+        g_wallpaper_dim = wallpaper_dim_resolve(val);   // darken the wallpaper 0-80% (0 = off)
+    }
 }
 
 // Write the current theme (wallpaper style + accent color + widget state) back to
@@ -4007,6 +4157,9 @@ static void apply_nyx_config(void) {
 // reboots — apply_nyx_config reads it at desktop start. The inverse of apply_nyx_config.
 void save_nyx_config(void) {
     char buf[320];
+    char acc[16];   // a #RRGGBB accent has no palette name — persist it so the GUI save round-trips
+    accent_config_str(wallpaper_is_rgb_override(), wallpaper_override_rgb(),
+                      wallpaper_color_name(wallpaper_color()), acc, sizeof acc);
     int n = snprintf(buf, sizeof buf,
         "# NyxOS desktop config -- rice it here (also editable from the Wallpaper picker).\n"
         "wallpaper = %s\n"
@@ -4014,13 +4167,15 @@ void save_nyx_config(void) {
         "widget = %s\n"
         "widget_pos = %s\n"
         "clock = %s\n"
-        "gaps = %d\n",
+        "gaps = %d\n"
+        "icons = %s\n",
         wallpaper_style_name(wallpaper_style()),
-        wallpaper_color_name(wallpaper_color()),
+        acc,
         g_widget_on ? "on" : "off",
         widget_pos_name(g_widget_pos),
         g_clock_12h ? "12h" : "24h",
-        g_gaps);
+        g_gaps,
+        g_desktop_icons_visible ? "on" : "off");
     if (n <= 0) return;
     int fd = vfs_open("/etc/nyx.conf", O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { vfs_write(fd, buf, (size_t)n); vfs_close(fd); }
