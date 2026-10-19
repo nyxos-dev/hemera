@@ -3099,7 +3099,8 @@ void window_resize(int id, uint32_t w, uint32_t h) {
 
 void window_minimize(int id) {
     window_t* win = find_window(id);
-    if (!win) return;
+    if (!win || win->state == WSTATE_MINIMIZED) return;
+    win->minimized_state = win->state;
     win->state = WSTATE_MINIMIZED;
     win->visible = 1;
     win->focused = 0;
@@ -3320,6 +3321,17 @@ void window_restore(int id) {
     win->x = win->normal_x; win->y = win->normal_y;
     win->w = win->normal_w; win->h = win->normal_h;
     win->state = WSTATE_NORMAL;
+}
+
+static void window_unminimize(int id) {
+    window_t* win = find_window(id);
+    if (!win || win->state != WSTATE_MINIMIZED) return;
+    int state = win->minimized_state;
+    win->state = (state == WSTATE_MAXIMIZED || win_is_snapped(state))
+               ? state : WSTATE_NORMAL;
+    apply_snap_geom(win);  // the display mode or gaps may have changed while hidden
+    win->workspace = current_workspace;
+    window_focus(id);
 }
 
 // Drop-snap: SET a window outright to `state` (from a title-bar drag onto a screen
@@ -3775,8 +3787,39 @@ static void draw_icon_at(int i) {
 int g_widget_on = 1;              // set from /etc/nyx.conf (apply_nyx_config); default on
 int g_widget_pos = 0;             // 0=bottom-right (default) 1=bottom-left 2=top-right 3=top-left — nyx.conf `widget_pos`
 static uint8_t wgt_cpu[WGT_N], wgt_ram[WGT_N], wgt_net[WGT_N];
-static uint64_t wgt_net_last;         // net_total_bytes() at the previous sample
+typedef struct {
+    uint64_t bytes;
+    uint32_t ms;
+    int ready;
+} net_sample_t;
+static net_sample_t wgt_net_sample;
 static unsigned long wgt_net_bps;     // current NET rate (bytes/s) for the caption
+
+static unsigned long net_sample_rate(net_sample_t* sample, uint64_t total, uint32_t now) {
+    uint32_t elapsed = now - sample->ms;
+    if (!sample->ready || total < sample->bytes) {
+        *sample = (net_sample_t){total, now, 1};
+        return 0;
+    }
+    if (!elapsed) return 0;  // Keep bytes until a nonzero measurement interval.
+    uint64_t delta = total - sample->bytes;
+    *sample = (net_sample_t){total, now, 1};
+    // Divide first: neither delta * 1000 nor the final sum may wrap.
+    uint64_t whole = delta / elapsed, fraction = (delta % elapsed) * 1000u / elapsed;
+    if (whole > ~0UL / 1000u) return ~0UL;
+    unsigned long rate = (unsigned long)whole * 1000u;
+    return fraction > ~0UL - rate ? ~0UL : rate + (unsigned long)fraction;
+}
+
+static uint32_t net_rate_percent(unsigned long rate) {
+    return rate >= WGT_NET_REF ? 100u : (uint32_t)(rate * 100u / WGT_NET_REF);
+}
+
+static void wgt_reset_samples(void) {
+    wgt_net_sample = (net_sample_t){0};
+    wgt_net_bps = 0;
+    for (int i = 0; i < WGT_N; i++) wgt_cpu[i] = wgt_ram[i] = wgt_net[i] = 0;
+}
 
 // nyx.conf name <-> index for the widget corner (rice: place the monitor where you like).
 static const char* widget_pos_name(int p) {
@@ -3825,24 +3868,46 @@ int net_rate_selftest(void) {
     net_rate_str(1048575, b, sizeof b);  if (strcmp(b, "1023 KB/s") != 0) return 6;
     net_rate_str(1048576, b, sizeof b);  if (strcmp(b, "1 MB/s")    != 0) return 7;
     net_rate_str(5242880, b, sizeof b);  if (strcmp(b, "5 MB/s")    != 0) return 8;
+    net_sample_t s = {0};
+    if (net_sample_rate(&s, 100000, 100) != 0) return 9;
+    if (net_sample_rate(&s, 101000, 600) != 2000) return 10;
+    if (net_sample_rate(&s, 102000, 5600) != 200) return 11;
+    if (net_sample_rate(&s, 103000, 65600) != 16) return 12;
+    if (net_sample_rate(&s, 103500, 65600) != 0) return 13;
+    if (net_sample_rate(&s, 104000, 66100) != 2000) return 14;
+    if (net_sample_rate(&s, 10, 66600) != 0) return 15;
+    if (net_sample_rate(&s, 510, 67100) != 1000) return 16;
+    s = (net_sample_t){100, 0xffffff00u, 1};
+    if (net_sample_rate(&s, 600, 244) != 1000) return 17;
+    s = (net_sample_t){0, 0, 1};
+    if (net_sample_rate(&s, ~(uint64_t)0, 1) != ~0UL) return 18;
+    s = (net_sample_t){0, 0, 1};
+    if (net_sample_rate(&s, ~(uint64_t)0, 1000) != ~0UL) return 19;
+    if (net_rate_percent(~0UL) != 100 || net_rate_percent(WGT_NET_REF) != 100 ||
+        net_rate_percent(WGT_NET_REF / 2) != 50 || net_rate_percent(0) != 0) return 20;
     return 0;
 }
 
 // Push the current CPU%, RAM% and NET rate and scroll all three histories one sample left.
-static void wgt_push_sample(void) {
+static void wgt_push_sample(uint32_t now) {
     uint32_t c = perf_cpu_percent(); if (c > 100) c = 100;
     uint32_t r = wgt_ram_pct();      if (r > 100) r = 100;
-    // NET: bytes since the last sample -> a per-second rate over the WGT_SAMPLE_MS window,
-    // normalized against WGT_NET_REF for the 0..100 bar height. Counters only ever climb.
-    uint64_t tot = net_total_bytes();
-    uint64_t delta = (tot >= wgt_net_last) ? (tot - wgt_net_last) : 0;
-    wgt_net_last = tot;
-    wgt_net_bps = (unsigned long)(delta * 1000u / WGT_SAMPLE_MS);
-    uint32_t np = (uint32_t)(wgt_net_bps * 100u / WGT_NET_REF); if (np > 100) np = 100;
+    wgt_net_bps = net_sample_rate(&wgt_net_sample, net_total_bytes(), now);
+    uint32_t np = net_rate_percent(wgt_net_bps);
     for (int i = 1; i < WGT_N; i++) { wgt_cpu[i-1] = wgt_cpu[i]; wgt_ram[i-1] = wgt_ram[i]; wgt_net[i-1] = wgt_net[i]; }
     wgt_cpu[WGT_N - 1] = (uint8_t)c;
     wgt_ram[WGT_N - 1] = (uint8_t)r;
     wgt_net[WGT_N - 1] = (uint8_t)np;
+}
+
+static int wgt_sample_tick(uint32_t now) {
+    if (!g_widget_on) {
+        if (wgt_net_sample.ready) wgt_reset_samples();
+        return 0;
+    }
+    if (wgt_net_sample.ready && now - wgt_net_sample.ms < WGT_SAMPLE_MS) return 0;
+    wgt_push_sample(now);
+    return 1;
 }
 
 // Does any visible window overlap the widget's rect? (If so, skip its partial repaint — it
@@ -4012,11 +4077,18 @@ int accent_config_selftest(void) {
 // nyx.conf `rounding` — the window/menu corner radius in px, clamped to [0, WIN_RADIUS_MAX].
 // 0 = fully square windows (a classic rice choice); a leading non-digit or NULL -> 0. Pure
 // (does not set g_corner_radius) so the KAT can check the parse in isolation.
-static int rounding_resolve(const char* val) {
+static int config_uint(const char* val, int maximum) {
     int r = 0;
-    if (val) for (const char* p = val; *p >= '0' && *p <= '9'; p++) r = r * 10 + (*p - '0');
-    if (r > WIN_RADIUS_MAX) r = WIN_RADIUS_MAX;
-    return r < 0 ? 0 : r;
+    if (val) for (const char* p = val; *p >= '0' && *p <= '9'; p++) {
+        int digit = *p - '0';
+        if (r > maximum / 10 || r * 10 + digit > maximum) r = maximum;
+        else r = r * 10 + digit;
+    }
+    return r;
+}
+
+static int rounding_resolve(const char* val) {
+    return config_uint(val, WIN_RADIUS_MAX);
 }
 
 // KAT: the `rounding` parser clamps to [0, WIN_RADIUS_MAX] and maps NULL / non-numeric to 0.
@@ -4036,10 +4108,7 @@ int rounding_selftest(void) {
 // set g_wallpaper_dim) so the KAT can check the parse in isolation.
 #define WALLPAPER_DIM_MAX 80
 static int wallpaper_dim_resolve(const char* val) {
-    int d = 0;
-    if (val) for (const char* p = val; *p >= '0' && *p <= '9'; p++) d = d * 10 + (*p - '0');
-    if (d > WALLPAPER_DIM_MAX) d = WALLPAPER_DIM_MAX;
-    return d < 0 ? 0 : d;
+    return config_uint(val, WALLPAPER_DIM_MAX);
 }
 
 // KAT: the `wallpaper_dim` parser clamps to [0, WALLPAPER_DIM_MAX] and maps NULL / non-numeric to 0.
@@ -4141,20 +4210,61 @@ int scheme_selftest(void) {
     return 0;
 }
 
-// Rice config foundation (v6.5.23): read /etc/nyx.conf at desktop start and apply the
-// desktop settings it names. A missing file or unknown value just leaves the defaults, so
-// the desktop always comes up. Currently drives the wallpaper style + accent color; future
-// keys (font, taskbar…) hang off the same parser.
-static void apply_nyx_config(void) {
-    theme_set_accent(fb_rgb(130, 90, 210));     // Morado default UI accent (may be overridden below)
-    int fd = vfs_open("/etc/nyx.conf", 0, 0);   // O_RDONLY; -1 if absent
-    if (fd < 0) return;
-    static char buf[2048];
-    int n = vfs_read(fd, buf, sizeof(buf) - 1);
-    vfs_close(fd);
-    if (n <= 0) return;
+void reset_nyx_config(void) {
+    terminal_set_palette("classic");
+    wallpaper_set_style(WP_STYLE_NIGHTFALL);
+    wallpaper_set_color(0);
+    theme_set_accent(wallpaper_base_color());
+    g_widget_on = 1; g_widget_pos = 0;
+    wgt_reset_samples();
+    g_clock_12h = 0; g_desktop_icons_visible = 0; g_gaps = 0;
+    g_border_color = 0; g_border_inactive = 0; g_panel_tint = 0;
+    g_corner_radius = WIN_RADIUS; g_shadows = 1;
+    g_title_center = 0; g_wallpaper_dim = 0;
+}
+
+static int user_config_path(char* path, int cap) {
+    if (g_login_home[0] != '/') return 0;
+    int n = snprintf(path, cap, "%s%snyx.conf", g_login_home,
+                     g_login_home[strlen(g_login_home) - 1] == '/' ? "" : "/");
+    return n > 0 && n < cap;
+}
+
+// Read the whole bounded image before applying anything. Mounted reads bypass cached
+// VFS handles so save verification checks the filesystem's returned bytes.
+static int read_nyx_config(const char* path, char* buf, int cap) {
+    uint32_t size = 0; int is_dir = 0;
+    mount_entry_t* me = vfs_find_mount(path);
+    int n;
+    if (me) {
+        const char* sub = path + strlen(me->mount_point);
+        if (!*sub) sub = "/";
+        if (!me->resolve || !me->read_file || !me->get_size || !me->readdir) return -2;
+        if (!me->resolve(sub)) return -1;
+        dirent_t entry;
+        if (me->readdir(sub, &entry, 1) >= 0) return -2;
+        size = me->get_size(sub);
+        if (size >= (uint32_t)cap) return -2;
+        n = me->read_file(sub, buf, (uint32_t)cap - 1);
+        if (me->get_size(sub) != size) return -2;
+    } else {
+        if (vfs_stat(path, &size, &is_dir) < 0) return -1;
+        if (is_dir || size >= (uint32_t)cap) return -2;
+        int fd = vfs_open(path, 0, 0);
+        if (fd < 0) return -2;
+        n = vfs_read(fd, buf, (size_t)cap - 1);
+        if (vfs_close(fd) < 0) return -2;
+    }
+    if (n < 0 || (uint32_t)n != size) return -2;
+    for (int i = 0; i < n; i++) if (!buf[i]) return -2;
     buf[n] = '\0';
+    return n;
+}
+
+static void apply_config_text(const char* buf) {
     char val[64];
+    if (nyxconf_get(buf, "terminal_palette", val, sizeof val))
+        terminal_set_palette(val);
     if (nyxconf_get(buf, "wallpaper", val, sizeof val)) {
         int s = wallpaper_style_from_name(val);
         if (s >= 0) wallpaper_set_style(s);
@@ -4199,10 +4309,7 @@ static void apply_nyx_config(void) {
                                    strcmp(val, "true") == 0 || strcmp(val, "yes") == 0);
     }
     if (nyxconf_get(buf, "gaps", val, sizeof val)) {
-        int gp = 0;                                  // px between tiles + around the screen
-        for (const char* p = val; *p >= '0' && *p <= '9'; p++) gp = gp * 10 + (*p - '0');
-        if (gp > 64) gp = 64;                        // clamp to a sane rice range
-        g_gaps = gp;
+        g_gaps = config_uint(val, 64);
     }
     if (nyxconf_get(buf, "border", val, sizeof val)) {
         g_border_color = border_resolve(val);        // focused-window outline; 0 = follow accent
@@ -4211,10 +4318,7 @@ static void apply_nyx_config(void) {
         g_border_inactive = border_resolve(val);     // unfocused-window outline; 0 = neutral bevel
     }
     if (nyxconf_get(buf, "panel_tint", val, sizeof val)) {
-        int t = 0;                                   // % the taskbar tints toward the wallpaper
-        for (const char* p = val; *p >= '0' && *p <= '9'; p++) t = t * 10 + (*p - '0');
-        if (t > 100) t = 100;
-        g_panel_tint = t;
+        g_panel_tint = config_uint(val, 100);
     }
     if (nyxconf_get(buf, "rounding", val, sizeof val)) {
         g_corner_radius = rounding_resolve(val);      // window/menu corner radius; 0 = square
@@ -4230,9 +4334,18 @@ static void apply_nyx_config(void) {
     }
 }
 
-// Write the current theme (wallpaper style + accent color + widget state) back to
-// /etc/nyx.conf, so a change made in the GUI (the Wallpaper theme picker) persists across
-// reboots — apply_nyx_config reads it at desktop start. The inverse of apply_nyx_config.
+static void apply_nyx_config(void) {
+    static char buf[2048];
+    char path[96];
+    reset_nyx_config();
+    int n = read_nyx_config("/etc/nyx.conf", buf, sizeof buf);
+    if (n >= 0) apply_config_text(buf);
+    if (!user_config_path(path, sizeof path)) return;
+    n = read_nyx_config(path, buf, sizeof buf);
+    if (n >= 0) apply_config_text(buf);
+    else if (n == -2) notify_push("Desktop settings", "Saved settings unreadable");
+}
+
 // Reverse of border_resolve for save_nyx_config: 0 -> "accent", else the palette name whose
 // rgb matches (a border only ever holds 0 or one of the 11 palette colors, so this round-trips
 // exactly). An unrecognised rgb falls back to "accent" so the write is always valid.
@@ -4270,7 +4383,8 @@ void save_nyx_config(void) {
         "rounding = %d\n"
         "shadow = %s\n"
         "title_align = %s\n"
-        "wallpaper_dim = %d\n",
+        "wallpaper_dim = %d\n"
+        "terminal_palette = %s\n",
         wallpaper_style_name(wallpaper_style()),
         acc,
         g_widget_on ? "on" : "off",
@@ -4283,11 +4397,19 @@ void save_nyx_config(void) {
         g_corner_radius,
         g_shadows ? "on" : "off",
         g_title_center ? "center" : "left",
-        g_wallpaper_dim);
-    if (n <= 0) return;
-    if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;   // snprintf returns the intended length; clamp to what fit
-    int fd = vfs_open("/etc/nyx.conf", O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) { vfs_write(fd, buf, (size_t)n); vfs_close(fd); }
+        g_wallpaper_dim, terminal_palette_name());
+    char path[96], check[640];
+    if (n <= 0 || n >= (int)sizeof buf || !user_config_path(path, sizeof path)) {
+        notify_push("Desktop settings", "Could not save your settings");
+        return;
+    }
+    mount_entry_t* me = vfs_find_mount(path);
+    if ((me && !me->write_file) || vfs_write_file(path, buf, (uint32_t)n) != n ||
+        read_nyx_config(path, check, sizeof check) != n || strcmp(buf, check)) {
+        notify_push("Desktop settings", "Save failed; active for now");
+        return;
+    }
+    notify_push("Desktop settings", me ? "Saved in your home on disk" : "Saved in RAM; lost on reboot");
 }
 
 static void draw_welcome_windows(void) {
@@ -4361,7 +4483,7 @@ void compositor_run(void) {
     uint8_t prev_btns = 0;
     ss_last_activity = get_ticks(); screensaver_active = 0;   // start the idle timer fresh
 
-    apply_nyx_config();          // rice: /etc/nyx.conf picks the wallpaper/accent before first paint
+    apply_nyx_config();          // defaults, system config, then this account's saved settings
     draw_welcome_windows();
     redraw_all();
     save_cursor_bg(mouse_x, mouse_y);
@@ -4544,7 +4666,7 @@ void compositor_run(void) {
         }
 
         // Right-click: desktop context menu
-        if ((btns & 2) && !(btns & 1)) {
+        if ((btns & 2) && !(prev_btns & 2) && !(btns & 1)) {
             // Check if we hit desktop (not on a window, not on taskbar)
             int on_desktop = 1;
             if (my >= (int)(fh - TASKBAR_H)) on_desktop = 0; // taskbar (fh: the function-level framebuffer height)
@@ -4831,9 +4953,7 @@ void compositor_run(void) {
                         window_t* w = find_window(tb_win_id);
                         if (w) {
                             if (w->state == WSTATE_MINIMIZED) {
-                                w->state = WSTATE_NORMAL;
-                                w->workspace = current_workspace;
-                                window_focus(tb_win_id);
+                                window_unminimize(tb_win_id);
                             } else if (w->focused) {
                                 window_minimize(tb_win_id);
                             } else {
@@ -5139,10 +5259,7 @@ done_click:
         // full recomposite is already happening (redraw) it repaints with the frame; else,
         // when the widget isn't covered by a window, flag a widget-only partial repaint (its
         // ~180x76 rect, not the whole screen) so the graph animates without a full present.
-        static uint32_t wgt_ms = 0;
-        if (g_widget_on && now - wgt_ms >= WGT_SAMPLE_MS) {
-            wgt_ms = now;
-            wgt_push_sample();
+        if (wgt_sample_tick(now)) {
             if (!redraw && !widget_covered()) widget_only = 1;
         }
 
