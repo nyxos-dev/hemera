@@ -2179,6 +2179,7 @@ window_t* compositor_open_editor(const char* path) {
     ewin->on_mousemove = editor_win_mousemove;
     ewin->on_key = editor_win_key;
     ewin->on_close = editor_win_close;   // free the undo snapshots when the window closes
+    ewin->can_close = editor_win_can_close;
     if (path && path[0]) editor_load_file((editor_win_t*)ewin->reserved, path);
     return ewin;
 }
@@ -2326,6 +2327,8 @@ void launch_nyxflex(void) {
         tw->reserved = terminal_create_ctx();
         if (tw->reserved) {
             tw->on_key = terminal_win_key;
+            tw->on_tick = terminal_win_tick;
+            tw->on_close = terminal_win_close;
             for (const char* c = "nyxfetch\n"; *c; c++) terminal_win_key(tw, (unsigned char)*c);
         } else window_destroy(tw->id);
     }
@@ -2571,7 +2574,11 @@ static void do_start_menu_action(int idx) {
                 if (twin) {
                     twin->cursor_shape = CURSOR_IBEAM;   // Erebus: text area -> I-beam pointer
                     twin->reserved = terminal_create_ctx();
-                    twin->on_key = terminal_win_key;
+                    if (twin->reserved) {
+                        twin->on_key = terminal_win_key;
+                        twin->on_tick = terminal_win_tick;
+                        twin->on_close = terminal_win_close;
+                    } else window_destroy(twin->id);
                 }
             }
             break;
@@ -3010,6 +3017,23 @@ static void window_cycle_focus(void) {
         window_focus(w->id);
         return;
     }
+}
+
+void window_request_close(int id) {
+    window_t* win = find_window(id);
+    if (win) win->close_requested = 1;
+}
+
+static int window_process_close_requests(void) {
+    int changed = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t* win = windows[i];
+        if (!win || !win->close_requested) continue;
+        win->close_requested = 0;
+        changed = 1;
+        if (!win->can_close || win->can_close(win)) window_destroy(win->id);
+    }
+    return changed;
 }
 
 void window_destroy(int id) {
@@ -4496,7 +4520,6 @@ void compositor_run(void) {
     // window footprint, incl. drop shadow) each move so the present publishes just that rect
     // instead of the whole 3 MB screen. Reset every iteration.
     int drag_dmg_valid = 0, ddx = 0, ddy = 0, ddw = 0, ddh = 0;
-    extern volatile int kbd_head, kbd_tail;
     while (!quit) {
         drag_dmg_valid = 0;   // recomputed by the drag handler each iteration
         // Idle-yield: when nothing is happening — no key queued, no mouse button
@@ -4505,7 +4528,7 @@ void compositor_run(void) {
         // get the time. Any activity skips the sleep, so interactivity is unchanged;
         // the wakeup is within ~5ms (imperceptible). sleep() blocks via the scheduler
         // when it's running, or idles (hlt) to the tick otherwise.
-        if (kbd_head == kbd_tail && mouse_get_buttons() == 0 &&
+        if (!keyboard_has_input() && mouse_get_buttons() == 0 &&
             mouse_get_x() == mouse_x && mouse_get_y() == mouse_y &&
             mouse_get_z() == mouse_z &&
             !drag_id && !resize_id && drag_icon_idx < 0 &&
@@ -4999,7 +5022,7 @@ void compositor_run(void) {
                     redraw = 1;
 
                     if (close_hit(hit, mx, my)) {
-                        window_destroy(hit->id);
+                        window_request_close(hit->id);
                     } else if (max_hit(hit, mx, my)) {
                         if (hit->state == WSTATE_MAXIMIZED) window_restore(hit->id);
                         else window_maximize(hit->id);
@@ -5112,7 +5135,7 @@ void compositor_run(void) {
                 window_t* awin = find_window(focused_id);
                 if (awin) {
                     if (k == KEY_F4) {                 // Alt+F4: close
-                        window_destroy(awin->id);
+                        window_request_close(awin->id);
                         redraw = 1;
                         goto done_click;
                     }
@@ -5164,6 +5187,10 @@ done_click:
         // Every dispatch path consumes this edge, including menu actions that
         // jump here. Otherwise a held press toggles the menu again each frame.
         prev_btns = btns;
+
+        // A client click can also be followed by on_pressed in this iteration.
+        // Release accepted user closes only after all event callbacks return.
+        redraw |= window_process_close_requests();
 
         int old_cx = mouse_x, old_cy = mouse_y;   // where the cursor started this frame
         int moved = (mx != mouse_x || my != mouse_y);
