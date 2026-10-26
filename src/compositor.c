@@ -45,6 +45,22 @@ static int quit = 0;
 static int compositor_active = 0;
 static int current_workspace = 0;
 
+// Key handlers run serially in the compositor; nested dispatch restores its caller.
+static unsigned dispatched_key_modifiers;
+
+unsigned window_key_modifiers(void) {
+    return dispatched_key_modifiers;
+}
+
+static void window_dispatch_key(window_t* win, int key, unsigned modifiers) {
+    if (!win || !win->on_key) return;
+    unsigned previous = dispatched_key_modifiers;
+    dispatched_key_modifiers = modifiers;
+    win->on_key(win, key);
+    dispatched_key_modifiers = previous;
+}
+
+
 static uint32_t taskbar_bg, taskbar_fg, taskbar_hl;
 static uint32_t desktop_bg, title_active, title_inactive;
 
@@ -2050,6 +2066,35 @@ void compositor_redraw_now(void) {
     frame_dirty = 0;
 }
 
+// A foreground terminal waiting for input has no new pixels. Keep its output
+// responsive at the existing pump cadence, but refresh quiet desktop indicators
+// only twice a second. The welcome card is static; other renderers and animated scenes retain the
+// unconditional path until they expose their own damage notifications.
+#define FOREGROUND_IDLE_REFRESH_MS 500u
+
+void compositor_foreground_tick(void) {
+    if (!fb_get_width() || !fb_get_height()) return;
+    static uint32_t last_revision, last_draw;
+    static int initialized;
+    uint32_t now = get_ticks();
+    uint32_t revision = terminal_capture_revision();
+    int continuous = wallpaper_animated() || notify_active_count(now);
+    for (int i = 0; i < MAX_WINDOWS && !continuous; i++) {
+        window_t* win = windows[i];
+        if (win && win->visible && win->state != WSTATE_MINIMIZED &&
+            win->workspace == current_workspace && win->draw != terminal_win_draw &&
+            win->draw != welcome_draw_fn)
+            continuous = 1;
+    }
+    if (initialized && !continuous && revision == last_revision &&
+        (uint32_t)(now - last_draw) < FOREGROUND_IDLE_REFRESH_MS) return;
+    // Snapshot before drawing so output produced during the paint is not lost.
+    last_revision = revision;
+    last_draw = now;
+    initialized = 1;
+    compositor_redraw_now();
+}
+
 // Dirty-rect groundwork (FLUIDEZ): is any window ABOVE `a` (higher z, so it draws
 // on top in redraw_all's sorted pass) overlapping a's footprint — INCLUDING the
 // drop-shadow margin, since a higher window's shadow can fall onto a? If so, a
@@ -3002,21 +3047,41 @@ int title_set_selftest(void) {
     return rc;
 }
 
+static int window_accepts_input(const window_t* win) {
+    return win && win->visible && win->state != WSTATE_MINIMIZED
+        && win->workspace == current_workspace;
+}
+
+static window_t* focused_window(void) {
+    window_t* win = find_window(focused_id);
+    return window_accepts_input(win) ? win : NULL;
+}
+
+static void clear_window_focus(void) {
+    focused_id = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (windows[i]) windows[i]->focused = 0;
+}
+
 static void focus_next_window(void) {
     // Find the highest-z-order visible, non-minimized window
     window_t* best = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!windows[i] || !windows[i]->visible) continue;
-        if (windows[i]->state == WSTATE_MINIMIZED) continue;
-        if (windows[i]->workspace != current_workspace) continue;
+        if (!window_accepts_input(windows[i])) continue;
         if (!best || windows[i]->z_order > best->z_order)
             best = windows[i];
     }
     if (best) {
         window_focus(best->id);
     } else {
-        focused_id = 0;
+        clear_window_focus();
     }
+}
+
+static void workspace_select(int ws) {
+    if (ws < 0 || ws >= WORKSPACE_COUNT || ws == current_workspace) return;
+    current_workspace = ws;
+    focus_next_window();
 }
 
 // Alt+Tab: focus the next window in a stable, repeatable cycle.
@@ -3035,11 +3100,11 @@ static void window_cycle_focus(void) {
     for (int step = 1; step <= MAX_WINDOWS; step++) {
         int i = (start + step) % MAX_WINDOWS;
         window_t* w = windows[i];
-        if (!w || !w->visible || w->state == WSTATE_MINIMIZED) continue;
-        if (w->workspace != current_workspace) continue;
+        if (!window_accepts_input(w)) continue;
         window_focus(w->id);
         return;
     }
+    clear_window_focus();
 }
 
 void window_request_close(int id) {
@@ -3110,7 +3175,7 @@ int window_focus_selftest(void) {
 
 void window_focus(int id) {
     window_t* win = find_window(id);
-    if (!win || !win->visible || win->state == WSTATE_MINIMIZED) return;
+    if (!window_accepts_input(win)) return;
     win->focused = 1;
     raise_window(windows, MAX_WINDOWS, win);
     focused_id = id;
@@ -3401,8 +3466,9 @@ static void window_snap_to(int id, int state) {
 
 void window_set_workspace(int id, int ws) {
     window_t* win = find_window(id);
-    if (!win) return;
+    if (!win || ws < 0 || ws >= WORKSPACE_COUNT || ws == win->workspace) return;
     win->workspace = ws;
+    if (focused_id == id) focus_next_window();
 }
 
 int window_get_count(void) { return window_count; }
@@ -4287,11 +4353,14 @@ static int read_nyx_config(const char* path, char* buf, int cap) {
         const char* sub = path + strlen(me->mount_point);
         if (!*sub) sub = "/";
         if (!me->resolve || !me->read_file || !me->get_size || !me->readdir) return -2;
-        if (!me->resolve(sub)) return -1;
+        int64_t exists = me->resolve(sub);
+        if (exists < 0) return -2;
+        if (!exists) return -1;
         dirent_t entry;
         if (me->readdir(sub, &entry, 1) >= 0) return -2;
-        size = me->get_size(sub);
-        if (size >= (uint32_t)cap) return -2;
+        int64_t backing_size = me->get_size(sub);
+        if (backing_size < 0 || backing_size >= cap) return -2;
+        size = (uint32_t)backing_size;
         n = me->read_file(sub, buf, (uint32_t)cap - 1);
         if (me->get_size(sub) != size) return -2;
     } else {
@@ -4559,13 +4628,14 @@ void compositor_run(void) {
         kernel_poll_net();
         run_background_tasks();
 
-        int k = getkey_poll();
+        unsigned key_modifiers = 0;
+        int k = getkey_poll_with_modifiers(&key_modifiers);
 
         // MouseKeys — drive the pointer from the keyboard, essential on hardware with no
         // working mouse/touchpad (e.g. an 8" UMPC with one USB port). Hold Alt: W/A/S/D move
         // the cursor, Space left-clicks, C right-clicks. The key is consumed so it never leaks
         // to a focused app; movement clamps to the (possibly rotated) logical screen.
-        if (k && is_alt_pressed()) {
+        if (k && (key_modifiers & KEY_MOD_ALT)) {
             int nx = mouse_get_x(), ny = mouse_get_y(), hit = 1;
             const int STEP = 16;
             if      (k == 'w' || k == 'W') ny -= STEP;
@@ -4624,15 +4694,12 @@ void compositor_run(void) {
         // into the back buffer without setting `redraw`, so the finished frame must be
         // published in full — the cursor-only fast present below would miss it.
         int mm_dispatched = 0;
-        if (mx != mouse_x || my != mouse_y) {
-            window_t* fwin = NULL;
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                if (windows[i] && windows[i]->id == focused_id) {
-                    fwin = windows[i];
-                    break;
-                }
-            }
-            if (fwin && fwin->on_mousemove) {
+        if (mx != mouse_x || my != mouse_y || btns != prev_btns) {
+            window_t* fwin = focused_window();
+            // File drags and modal dismissal need stationary button edges too.
+            if (fwin && fwin->on_mousemove &&
+                (mx != mouse_x || my != mouse_y ||
+                 fwin->on_mousemove == fileman_win_mousemove)) {
                 fwin->on_mousemove(fwin, mx, my, btns);
                 mm_dispatched = 1;
             }
@@ -4645,10 +4712,10 @@ void compositor_run(void) {
             int notches = wz - mouse_z;
             int steps = notches < 0 ? -notches : notches;
             if (steps > 8) steps = 8;                    // clamp a fast flick
-            window_t* fwin = find_window(focused_id);
+            window_t* fwin = focused_window();
             if (fwin && fwin->on_key) {
                 int keycode = (notches > 0) ? KEY_WHEEL_UP : KEY_WHEEL_DOWN;
-                for (int s = 0; s < steps; s++) fwin->on_key(fwin, keycode);
+                for (int s = 0; s < steps; s++) window_dispatch_key(fwin, keycode, 0);
                 redraw = 1;
             }
             mouse_z = wz;
@@ -5098,7 +5165,7 @@ void compositor_run(void) {
                      * still contains the pointer, in its CONTENT area (below the
                      * title bar). Never re-pick — re-picking is what leaked the
                      * click to lower windows once the top one closed/moved. */
-                    window_t* fwin = find_window(focused_id);
+                    window_t* fwin = focused_window();
                     if (fwin && fwin->on_pressed && window_hit(fwin, mx, my)
                         && my >= fwin->y + TITLE_H) {
                         fwin->on_pressed(fwin, mx, my, 1);
@@ -5145,8 +5212,8 @@ void compositor_run(void) {
                 }
             }
             // Ctrl+1..4: workspace switching
-            if (is_ctrl_pressed() && k >= '1' && k <= '4') {
-                current_workspace = k - '1';
+            if ((key_modifiers & KEY_MOD_CTRL) && k >= '1' && k <= '4') {
+                workspace_select(k - '1');
                 redraw = 1;
                 goto done_click;
             }
@@ -5156,13 +5223,13 @@ void compositor_run(void) {
             // Terminal never also receives the Tab/arrow as input. Alt+Tab works
             // even with nothing focused (it picks the first window); the rest
             // need a target, so they no-op when focused_id is 0.
-            if (is_alt_pressed()) {
+            if ((key_modifiers & KEY_MOD_ALT)) {
                 if (k == '\t') {                       // Alt+Tab: cycle focus
                     window_cycle_focus();
                     redraw = 1;
                     goto done_click;
                 }
-                window_t* awin = find_window(focused_id);
+                window_t* awin = focused_window();
                 if (awin) {
                     if (k == KEY_F4) {                 // Alt+F4: close
                         window_request_close(awin->id);
@@ -5207,9 +5274,9 @@ void compositor_run(void) {
             }
 
             // Route all keys to focused window's key handler
-            window_t* fwin = find_window(focused_id);
+            window_t* fwin = focused_window();
             if (fwin && fwin->on_key && k > 0) {
-                fwin->on_key(fwin, k);
+                window_dispatch_key(fwin, k, key_modifiers);
                 redraw = 1;
             }
         }
@@ -5277,8 +5344,15 @@ done_click:
             game_tick_ms = now;
             for (int gi = 0; gi < MAX_WINDOWS; gi++)
                 if (windows[gi] && windows[gi]->on_tick && windows[gi]->visible) {
-                    if (windows[gi]->on_tick(windows[gi])) {
+                    int was_visible = window_accepts_input(windows[gi]);
+                    int changed = windows[gi]->on_tick(windows[gi]);
+                    int is_visible = window_accepts_input(windows[gi]);
+                    // Keep background callbacks running, but only their on-screen
+                    // changes damage this workspace. Include a window that hides
+                    // itself during the callback so its old pixels are erased.
+                    if (changed && (was_visible || is_visible)) {
                         redraw = 1;
+                        if (was_visible != is_visible) redraw_pre_tick = 1;
                         if (tick_changed < TICK_MAX_RECTS) tick_idx[tick_changed] = gi;
                         tick_changed++;   // total; only the first TICK_MAX_RECTS are recorded
                     }
